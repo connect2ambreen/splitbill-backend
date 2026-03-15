@@ -1,67 +1,116 @@
-import nodemailer from 'nodemailer';
-import dotenv from 'dotenv';
-dotenv.config();
+import { query } from "../config/db.js";
+import admin from "../config/firebase.js";
 
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD
-  }
-});
-
-export const sendEmail = async ({ to, subject, html, text }) => {
+const sendPushNotification = async (fcm_token, title, message, data = {}) => {
   try {
-    console.log('📧 Attempting to send email to:', to);
-    console.log('📧 Subject:', subject);
-    console.log('🔑 Using email:', process.env.EMAIL_USER);
+    const response = await admin.messaging().send({
+      token: fcm_token,
 
-    const mailOptions = {
-      from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
-      to,
-      subject,
-      html: html || text,
-      text: text
-    };
+      // ✅ NO notification field — prevents FCM from auto-displaying
+      // This is the fix for double notifications
 
-    const result = await transporter.sendMail(mailOptions);
+      data: {
+        title,           // ✅ moved here so all app states can read it
+        message,         // ✅ moved here
+        type: data.type ?? 'general',
+        group_id: String(data.group_id ?? ''),
+        related_expense_id: String(data.related_expense_id ?? ''),
+        related_settlement_id: String(data.related_settlement_id ?? ''),
+      },
 
-    console.log('✅ Email sent successfully:', result.messageId);
-    console.log('✅ Accepted recipients:', result.accepted);
-    console.log('✅ Response:', result.response);
-    return { success: true, messageId: result.messageId };
+      android: {
+        priority: 'high',
+        ttl: 3600000,
+        // ✅ NO android.notification block — we handle display via notifee
+      },
+
+      apns: {
+        headers: {
+          'apns-priority': '10',
+        },
+        payload: {
+          aps: {
+            contentAvailable: true, // wakes iOS in background
+            sound: 'default',
+            badge: 1,
+          },
+        },
+      },
+    });
+
+    console.log('Push sent:', response);
   } catch (error) {
-    console.error('❌ Email sending failed:');
-    console.error('   Error Code:', error.code);
-    console.error('   Error Message:', error.message);
-    console.error('   Response Code:', error.responseCode);
-    console.error('   Command:', error.command);
-    console.error('   Full Error:', error);
-
-    return { success: false, error: error.message };
+    if (
+      error.code === 'messaging/invalid-registration-token' ||
+      error.code === 'messaging/registration-token-not-registered'
+    ) {
+      console.warn('Invalid FCM token, removing from DB:', fcm_token);
+      await query(`UPDATE users SET fcm_token = NULL WHERE fcm_token = $1`, [fcm_token]);
+    } else {
+      console.error('Push notification error:', error);
+    }
   }
 };
 
-export const sendPasswordResetEmail = async (userEmail, token) => {
-  const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${token}`;
+export const notifyGroupMembers = async ({
+  group_id,
+  actor_user_id,
+  type,
+  title,
+  message,
+  related_expense_id,
+  related_settlement_id,
+}) => {
+  try {
+    console.log('📢 [NOTIFY] notifyGroupMembers called for group:', group_id);
 
-  return await sendEmail({
-    to: userEmail,
-    subject: 'Password Reset Request',
-    html: `<p>Click <a href="${resetLink}">here</a> to reset your password</p>`
-  });
-};
+    const result = await query(
+      `SELECT gm.user_id, u.fcm_token 
+       FROM group_members gm
+       JOIN users u ON u.id = gm.user_id
+       WHERE gm.group_id = $1 AND gm.is_active = true`,
+      [group_id]
+    );
 
-export const sendPasswordChangedNotification = async (email) => {
-  return await sendEmail({
-    to: email,
-    subject: 'Password Changed Successfully',
-    html: `
-      <h2>Password Changed</h2>
-      <p>Your password has been changed successfully.</p>
-      <p>If you did not make this change, please contact support immediately.</p>
-    `
-  });
+    console.log('📢 [NOTIFY] Total members found:', result.rows.length);
+    console.log('📢 [NOTIFY] Members:', result.rows.map(r => ({
+      user_id: r.user_id,
+      has_token: !!r.fcm_token
+    })));
+
+    const members = result.rows.filter(row => row.user_id !== actor_user_id);
+    console.log('📢 [NOTIFY] Members to notify (excluding actor):', members.length);
+
+    for (const member of members) {
+      // Save notification in DB
+      await query(
+        `INSERT INTO notifications 
+         (user_id, group_id, type, title, message, related_expense_id, related_settlement_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          member.user_id,
+          group_id,
+          type,
+          title,
+          message,
+          related_expense_id || null,
+          related_settlement_id || null,
+        ]
+      );
+
+      if (member.fcm_token) {
+        console.log('📱 [NOTIFY] Sending push to user:', member.user_id);
+        await sendPushNotification(member.fcm_token, title, message, {
+          type,
+          group_id,
+          related_expense_id,
+          related_settlement_id,
+        });
+      } else {
+        console.warn('⚠️ [NOTIFY] No FCM token for user:', member.user_id);
+      }
+    }
+  } catch (error) {
+    console.error('❌ [NOTIFY] notifyGroupMembers error:', error);
+  }
 };

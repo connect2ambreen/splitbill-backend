@@ -4,7 +4,7 @@ import {
   getAllUsers, addUsersToGroup, getGroupBalance, getGroupDetails, getGroupSummary,
   leaveGroup, deleteGroup, searchUsers, verifyInvitation, acceptInvitation,
   getPendingInvitations, updateGroup, declineInvitation,
-  removeMember, transferAdmin, // ✅ new
+  removeMember
 } from '../controllers/group.js';
 import { authenticate, isAdmin } from '../middleware/auth.js';
 
@@ -43,7 +43,6 @@ router.put('/groups/:group_id', authenticate, isAdmin, updateGroup);
 // ✅ Remove a member (admin only)
 router.delete('/groups/:group_id/members/:user_id', authenticate, isAdmin, removeMember);
 
-// ✅ Transfer admin ownership (admin only)
-router.post('/groups/:group_id/transfer-admin/:new_admin_id', authenticate, isAdmin, transferAdmin);
+
 
 export default router;

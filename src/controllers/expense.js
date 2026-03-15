@@ -1,4 +1,4 @@
-import { query } from "../config/db.js";
+import { query, pool } from "../config/db.js";
 import { notifyGroupMembers } from "../utils/notifyUsers.js";
 
 // ─── Helper: get user name ────────────────────────────────────────────────────
@@ -511,5 +511,16 @@ export const getNotifications = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error' });
   } finally {
     client.release(); // ALWAYS release back to pool
+  }
+};
+// ─── Mark Notifications Read ──────────────────────────────────────────────────
+export const markNotificationsRead = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    await query(`UPDATE notifications SET is_read = true WHERE user_id = $1`, [userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Mark notifications read error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 };
