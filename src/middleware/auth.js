@@ -22,8 +22,6 @@ export const authenticate = (req, res, next) => {
       userId: decoded?.id || decoded.identity,
       email: decoded.email || null
     };
-    console.log('🔐 JWT DECODED:', decoded);
-    console.log('✅ req.user set to:', req.user);
     next();
   } catch (error) {
     console.error('Authentication error:', error.message);

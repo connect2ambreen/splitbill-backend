@@ -1200,7 +1200,6 @@ export const declineInvitation = async (req, res) => {
   }
 };
 
-// ── Add these two controllers to your existing group controller file ──────────
 
 export const removeMember = async (req, res) => {
   try {
@@ -1330,96 +1329,4 @@ export const removeMember = async (req, res) => {
   }
 };
 
-
-export const transferAdmin = async (req, res) => {
-  try {
-    const { group_id, new_admin_id } = req.params;
-    const currentAdminId = req.user.userId;
-
-    const groupId = parseInt(group_id);
-    const newAdminId = parseInt(new_admin_id);
-
-    // Requester must be current admin
-    const requesterCheck = await query(
-      'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
-      [groupId, currentAdminId]
-    );
-
-    if (requesterCheck.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Group not found or you are not a member' });
-    }
-    if (requesterCheck.rows[0].role !== 'admin') {
-      return res.status(403).json({ success: false, message: 'Only the current admin can transfer ownership' });
-    }
-
-    // Cannot transfer to yourself
-    if (newAdminId === currentAdminId) {
-      return res.status(400).json({ success: false, message: 'You are already the admin' });
-    }
-
-    // New admin must be an active member
-    const targetCheck = await query(
-      'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
-      [groupId, newAdminId]
-    );
-
-    if (targetCheck.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Target user is not a member of this group' });
-    }
-
-    // Get new admin's name for notification
-    const newAdminUser = await query('SELECT name FROM users WHERE id = $1', [newAdminId]);
-    const newAdminName = newAdminUser.rows[0]?.name || 'New Admin';
-
-    // Get group name
-    const groupDetails = await query('SELECT name FROM groups WHERE id = $1', [groupId]);
-    const groupName = groupDetails.rows[0]?.name || 'the group';
-
-    // Swap roles
-    await query(
-      'UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_id = $3',
-      ['member', groupId, currentAdminId]
-    );
-    await query(
-      'UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_id = $3',
-      ['admin', groupId, newAdminId]
-    );
-
-    // Notify the new admin
-    try {
-      await query(
-        `INSERT INTO notifications (user_id, group_id, type, title, message)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          newAdminId,
-          groupId,
-          'member_left',
-          'You are now Admin',
-          `You have been made the admin of "${groupName}".`,
-        ]
-      );
-
-      const tokenResult = await query('SELECT fcm_token FROM users WHERE id = $1', [newAdminId]);
-      if (tokenResult.rows[0]?.fcm_token) {
-        await sendPushNotification(
-          tokenResult.rows[0].fcm_token,
-          'You are now Admin',
-          `You have been made the admin of "${groupName}".`,
-          { type: 'member_left', group_id: groupId }
-        );
-      }
-    } catch (notifyErr) {
-      console.error('Notification error (non-fatal):', notifyErr);
-    }
-
-    res.json({
-      success: true,
-      message: `${newAdminName} is now the admin of this group`,
-    });
-
-  } catch (error) {
-    console.error('Transfer admin error:', error);
-    res.status(500).json({ success: false, message: 'Server error while transferring admin' });
-  }
-};
 

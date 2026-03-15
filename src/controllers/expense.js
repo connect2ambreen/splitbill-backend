@@ -481,9 +481,18 @@ export const requestSettlement = async (req, res) => {
 };
 // ─── Get Notifications ────────────────────────────────────────────────────────
 export const getNotifications = async (req, res) => {
+  const client = await pool.connect(); // grab ONE dedicated connection
   try {
     const userId = req.user.userId;
-    const result = await query(`
+
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE notifications SET is_read = true WHERE user_id = $1`,
+      [userId]
+    );
+
+    const result = await client.query(`
       SELECT n.*, g.name as group_name
       FROM notifications n
       LEFT JOIN groups g ON n.group_id = g.id
@@ -491,21 +500,16 @@ export const getNotifications = async (req, res) => {
       ORDER BY n.created_at DESC
       LIMIT 50
     `, [userId]);
+
+    await client.query('COMMIT');
+
     res.json({ success: true, data: result.rows });
+
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Get notifications error:', err);
     res.status(500).json({ success: false, message: 'Server error' });
-  }
-};
-
-// ─── Mark Notifications Read ──────────────────────────────────────────────────
-export const markNotificationsRead = async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    await query(`UPDATE notifications SET is_read = true WHERE user_id = $1`, [userId]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Mark notifications read error:', err);
-    res.status(500).json({ success: false, message: 'Server error' });
+  } finally {
+    client.release(); // ALWAYS release back to pool
   }
 };

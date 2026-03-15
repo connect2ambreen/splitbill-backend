@@ -117,7 +117,7 @@ export const login = async (req, res) => {
       throw new Error('JWT_SECRET_KEY is not defined in the environment');
     }
 
-    const token = jwt.sign({ identity: user.id }, secretKey, { expiresIn: '7d' }); // ✅ was '1d'
+    const token = jwt.sign({ identity: user.id }, secretKey, { expiresIn: '7d' }); 
 
     res.json({
       success: true,

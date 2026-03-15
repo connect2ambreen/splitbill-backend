@@ -30,7 +30,7 @@ export const getDashboardData = async (req, res) => {
         WHERE es.user_id = $1 AND DATE_TRUNC('month', e.created_at) = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AND e.is_deleted = false`, [user_id]),
 
       // Weekly data - Fixed query
-      query(`
+      query(` 
         WITH week_numbers AS (
           SELECT 
             generate_series(1, 5) as week_num
