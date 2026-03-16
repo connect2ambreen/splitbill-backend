@@ -368,7 +368,19 @@ export const getUserGroups = async (req, res) => {
           FROM group_members gm2
           JOIN users mu ON gm2.user_id = mu.id
           WHERE gm2.group_id = g.id AND gm2.is_active = true
-        ) as members
+        ) as members,
+        COALESCE((
+          SELECT SUM(CASE WHEN es.paid_share > es.owed_share THEN es.paid_share - es.owed_share ELSE 0 END)
+          FROM expense_shares es
+          JOIN expenses e ON es.expense_id = e.id
+          WHERE e.group_id = g.id AND es.user_id = $1 AND e.is_deleted = false
+        ), 0) as owes_you,
+        COALESCE((
+          SELECT SUM(CASE WHEN es.owed_share > es.paid_share THEN es.owed_share - es.paid_share ELSE 0 END)
+          FROM expense_shares es
+          JOIN expenses e ON es.expense_id = e.id
+          WHERE e.group_id = g.id AND es.user_id = $1 AND e.is_deleted = false
+        ), 0) as you_owe
       FROM groups g
       JOIN group_members gm_current ON g.id = gm_current.group_id 
         AND gm_current.user_id = $1 
@@ -386,6 +398,8 @@ export const getUserGroups = async (req, res) => {
       ...group,
       member_count: parseInt(group.member_count),
       members: (group.members || []).filter(m => m && m.id !== null),
+      owes_you: parseFloat(group.owes_you || 0),
+      you_owe: parseFloat(group.you_owe || 0),
     }));
 
     res.json({
