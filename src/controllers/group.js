@@ -363,9 +363,11 @@ export const getUserGroups = async (req, res) => {
         g.created_at,
         u.name as created_by_name,
         COUNT(DISTINCT gm.user_id) as member_count,
-        JSON_AGG(
-          JSON_BUILD_OBJECT('id', mu.id, 'name', mu.name)
-          ORDER BY gm_users.joined_at ASC
+        (
+          SELECT JSON_AGG(JSON_BUILD_OBJECT('id', mu.id, 'name', mu.name) ORDER BY gm2.joined_at ASC)
+          FROM group_members gm2
+          JOIN users mu ON gm2.user_id = mu.id
+          WHERE gm2.group_id = g.id AND gm2.is_active = true
         ) as members
       FROM groups g
       JOIN group_members gm_current ON g.id = gm_current.group_id 
@@ -373,8 +375,6 @@ export const getUserGroups = async (req, res) => {
         AND gm_current.is_active = true
       LEFT JOIN group_members gm ON g.id = gm.group_id AND gm.is_active = true
       LEFT JOIN users u ON g.created_by = u.id
-      LEFT JOIN group_members gm_users ON g.id = gm_users.group_id AND gm_users.is_active = true
-      LEFT JOIN users mu ON gm_users.user_id = mu.id
       WHERE g.is_active = true
       GROUP BY g.id, g.name, g.description, g.group_type, g.default_currency, g.avatar_url, g.created_at, u.name
       ORDER BY g.created_at DESC
@@ -382,7 +382,6 @@ export const getUserGroups = async (req, res) => {
 
     const result = await query(groupsQuery, [user_id]);
 
-    // Clean up members array — remove nulls that can appear from LEFT JOIN
     const groups = result.rows.map(group => ({
       ...group,
       member_count: parseInt(group.member_count),
