@@ -1,6 +1,6 @@
 import { query } from "../config/db.js";
 import { generateUniqueInviteCode } from "../utils/inviteCode.js";
-import { notifyGroupMembers } from "../utils/notifyUsers.js";
+import { notifyGroupMembers, notifyInvitation, notifyInvitationAccepted } from "../utils/notifyUsers.js";
 import { sendEmail } from '../utils/emailService.js'; // Update path to your email file
 
 import crypto from 'crypto';
@@ -65,7 +65,6 @@ export const inviteToGroup = async (req, res) => {
 
     const group = groupResult.rows[0];
 
-    // If user_id provided, fetch that user
     let invitee = null;
     if (user_id) {
       const userResult = await query('SELECT * FROM users WHERE id = $1', [user_id]);
@@ -75,7 +74,6 @@ export const inviteToGroup = async (req, res) => {
       invitee = userResult.rows[0];
     }
 
-    // If user exists and is already a member, reject
     if (invitee) {
       const memberResult = await query(
         'SELECT * FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
@@ -87,7 +85,7 @@ export const inviteToGroup = async (req, res) => {
     }
 
     const invitationToken = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
     const inviteeEmail = email || (invitee && invitee.email);
     const inviteeName = name || (invitee && invitee.name) || null;
@@ -112,6 +110,18 @@ export const inviteToGroup = async (req, res) => {
       );
     }
 
+    // ── Notify invited user if they exist in the system ───────────────────
+    if (invitee) {
+      const inviterResult = await query('SELECT name FROM users WHERE id = $1', [inviterUserId]);
+      const inviterName = inviterResult.rows[0]?.name || 'Someone';
+      await notifyInvitation({
+        invitee_id: invitee.id,
+        group_id: groupId,
+        group_name: group.name,
+        inviter_name: inviterName,
+      });
+    }
+
     const invitationLink = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/invite/${invitationToken}`;
 
     res.json({
@@ -120,12 +130,74 @@ export const inviteToGroup = async (req, res) => {
       data: {
         user_exists: !!invitee,
         invitation_link: invitationLink,
-        expires_at: expiresAt
+        expires_at: expiresAt,
       }
     });
   } catch (error) {
     console.error('Invite to group error:', error);
     res.status(500).json({ success: false, message: 'Server error during invitation.' });
+  }
+};
+
+
+export const acceptInvitation = async (req, res) => {
+  try {
+    const { token } = req.params;
+    const userId = req.user && req.user.userId;
+    if (!userId) return res.status(401).json({ success: false, message: 'Authentication required' });
+
+    const invResult = await query('SELECT * FROM group_invitations WHERE invitation_token = $1', [token]);
+    if (invResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Invitation not found' });
+    }
+
+    const invitation = invResult.rows[0];
+    if (invitation.status !== 'pending') {
+      return res.status(400).json({ success: false, message: `Invitation is ${invitation.status}` });
+    }
+
+    if (new Date(invitation.expires_at) < new Date()) {
+      return res.status(400).json({ success: false, message: 'Invitation has expired' });
+    }
+
+    if (invitation.user_id && invitation.user_id !== userId) {
+      return res.status(403).json({ success: false, message: 'This invitation was not issued for your account' });
+    }
+
+    if (!invitation.user_id) {
+      const ures = await query('SELECT email FROM users WHERE id = $1', [userId]);
+      const currentEmail = ures.rows[0] && ures.rows[0].email;
+      if (invitation.invitee_email && currentEmail && invitation.invitee_email.toLowerCase() !== currentEmail.toLowerCase()) {
+        return res.status(403).json({ success: false, message: 'This invitation email does not match your account email' });
+      }
+    }
+
+    const memberCheck = await query(
+      'SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
+      [invitation.group_id, userId]
+    );
+    if (memberCheck.rows.length === 0) {
+      await query(
+        'INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES ($1, $2, $3, NOW())',
+        [invitation.group_id, userId, 'member']
+      );
+    }
+
+    await query(
+      'UPDATE group_invitations SET status = $1, accepted_at = NOW(), user_id = $2 WHERE id = $3',
+      ['accepted', userId, invitation.id]
+    );
+
+    // ── Notify group members that someone joined ──────────────────────────
+    await notifyInvitationAccepted({
+      new_member_id: userId,
+      group_id: invitation.group_id,
+    });
+
+    res.json({ success: true, message: 'Invitation accepted and you have been added to the group' });
+  } catch (error) {
+    console.error('Accept invitation error:', error);
+    res.status(500).json({ success: false, message: 'Server error during invitation acceptance.' });
   }
 };
 
@@ -220,55 +292,6 @@ export const verifyInvitation = async (req, res) => {
   }
 };
 
-
-export const acceptInvitation = async (req, res) => {
-  try {
-    const { token } = req.params;
-    const userId = req.user && req.user.userId;
-    if (!userId) return res.status(401).json({ success: false, message: 'Authentication required' });
-
-    const invResult = await query('SELECT * FROM group_invitations WHERE invitation_token = $1', [token]);
-    if (invResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Invitation not found' });
-    }
-
-    const invitation = invResult.rows[0];
-    if (invitation.status !== 'pending') {
-      return res.status(400).json({ success: false, message: `Invitation is ${invitation.status}` });
-    }
-
-    if (new Date(invitation.expires_at) < new Date()) {
-      return res.status(400).json({ success: false, message: 'Invitation has expired' });
-    }
-
-    // Allow accept only if the authenticated user matches invitee (by user_id or email)
-    if (invitation.user_id && invitation.user_id !== userId) {
-      return res.status(403).json({ success: false, message: 'This invitation was not issued for your account' });
-    }
-
-    if (!invitation.user_id) {
-      // fetch current user's email to compare
-      const ures = await query('SELECT email FROM users WHERE id = $1', [userId]);
-      const currentEmail = ures.rows[0] && ures.rows[0].email;
-      if (invitation.invitee_email && currentEmail && invitation.invitee_email.toLowerCase() !== currentEmail.toLowerCase()) {
-        return res.status(403).json({ success: false, message: 'This invitation email does not match your account email' });
-      }
-    }
-
-    // Check if already a member
-    const memberCheck = await query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true', [invitation.group_id, userId]);
-    if (memberCheck.rows.length === 0) {
-      await query('INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES ($1, $2, $3, NOW())', [invitation.group_id, userId, 'member']);
-    }
-
-    await query('UPDATE group_invitations SET status = $1, accepted_at = NOW(), user_id = $2 WHERE id = $3', ['accepted', userId, invitation.id]);
-
-    res.json({ success: true, message: 'Invitation accepted and you have been added to the group' });
-  } catch (error) {
-    console.error('Accept invitation error:', error);
-    res.status(500).json({ success: false, message: 'Server error during invitation acceptance.' });
-  }
-};
 
 
 export const getPendingInvitations = async (req, res) => {
