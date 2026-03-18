@@ -45,6 +45,8 @@ router.delete('/groups/:group_id/members/:user_id', authenticate, isAdmin, remov
 
 router.get('/activity/:user_id', authenticate, getUserActivity);
 
+router.get('/friends', authenticateToken, getFriends);
+
 
 
 export default router;
