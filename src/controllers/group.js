@@ -1446,3 +1446,32 @@ export const getUserActivity = async (req, res) => {
     });
   }
 };
+
+export const getFriends = async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+    const result = await query(`
+      SELECT DISTINCT
+        u.id,
+        u.name,
+        u.email,
+        COUNT(DISTINCT g.id) as shared_groups
+      FROM users u
+      JOIN group_members gm1 ON gm1.user_id = u.id AND gm1.is_active = true
+      JOIN group_members gm2 ON gm2.group_id = gm1.group_id 
+        AND gm2.user_id = $1 
+        AND gm2.is_active = true
+      JOIN groups g ON g.id = gm1.group_id AND g.is_active = true
+      WHERE u.id != $1
+      GROUP BY u.id, u.name, u.email
+      ORDER BY u.name ASC
+    `, [userId]);
+
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Get friends error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch friends' });
+  }
+};
