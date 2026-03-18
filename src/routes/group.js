@@ -4,7 +4,7 @@ import {
   getAllUsers, addUsersToGroup, getGroupBalance, getGroupDetails, getGroupSummary,
   leaveGroup, deleteGroup, searchUsers, verifyInvitation, acceptInvitation,
   getPendingInvitations, updateGroup, declineInvitation,
-  removeMember
+  removeMember, getUserActivity
 } from '../controllers/group.js';
 import { authenticate, isAdmin } from '../middleware/auth.js';
 
@@ -42,6 +42,8 @@ router.put('/groups/:group_id', authenticate, isAdmin, updateGroup);
 
 // ✅ Remove a member (admin only)
 router.delete('/groups/:group_id/members/:user_id', authenticate, isAdmin, removeMember);
+
+router.get('/activity/:user_id', authenticate, getUserActivity);
 
 
 

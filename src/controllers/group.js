@@ -1381,3 +1381,68 @@ export const removeMember = async (req, res) => {
 };
 
 
+export const getUserActivity = async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const userId = parseInt(user_id);
+
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'User ID is required' });
+    }
+
+    // Fetch all expenses where the user is involved (paid or owes)
+    const activityResult = await query(`
+      SELECT 
+        e.id,
+        e.description,
+        e.total_amount AS amount,
+        e.currency,
+        e.created_at AS date,
+        e.group_id,
+        g.name AS group_name,
+        u.name AS paid_by_name,
+        u.id AS paid_by_id,
+        es.paid_share,
+        es.owed_share,
+        CASE 
+          WHEN e.paid_by = $1 THEN 'you_paid'
+          ELSE 'you_owe'
+        END AS type
+      FROM expenses e
+      JOIN expense_shares es ON es.expense_id = e.id AND es.user_id = $1
+      LEFT JOIN groups g ON e.group_id = g.id
+      LEFT JOIN users u ON e.paid_by = u.id
+      WHERE e.is_deleted = false
+      ORDER BY e.created_at DESC
+    `, [userId]);
+
+    const activities = activityResult.rows.map(row => ({
+      id: row.id,
+      description: row.description,
+      amount: parseFloat(row.amount || 0).toFixed(2),
+      currency: row.currency || 'USD',
+      date: row.date,
+      group_id: row.group_id,
+      group_name: row.group_name || 'Personal',
+      paid_by_name: row.paid_by_name,
+      paid_by_id: row.paid_by_id,
+      paid_share: parseFloat(row.paid_share || 0).toFixed(2),
+      owed_share: parseFloat(row.owed_share || 0).toFixed(2),
+      type: row.type,
+    }));
+
+    res.json({
+      success: true,
+      data: activities,
+      total: activities.length,
+    });
+
+  } catch (error) {
+    console.error('Get user activity error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch user activity',
+      error: error.message,
+    });
+  }
+};
