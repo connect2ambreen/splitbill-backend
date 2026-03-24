@@ -6,6 +6,8 @@ import groupRoutes from './src/routes/group.js';
 import expenseRoutes from './src/routes/expense.js';
 import dashboardRoutes from './src/routes/dashboardRoutes.js';
 import userRoutes from './src/routes/user.js';
+import businessRoutes from './src/routes/businessRoutes.js';
+import customerRoutes from './src/routes/customerRoutes.js';
 
 dotenv.config();
 
@@ -19,6 +21,8 @@ app.use('/api', authRoutes);
 app.use('/api', groupRoutes);
 app.use('/api', expenseRoutes);
 app.use('/api', userRoutes);
+app.use('/api', businessRoutes);
+app.use('/api', customerRoutes);
 
 app.get('/', (req, res) => {
   res.json({ status: 'OK', message: 'SplitBill API is running' });
