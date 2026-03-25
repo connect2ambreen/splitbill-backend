@@ -54,6 +54,9 @@ export const getUserBusiness = async (req, res) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
+    console.log("REQ USER:", req.user);
+    console.log("USER ID:", userId);
+
     const result = await query(
       'SELECT * FROM businesses WHERE user_id = $1 AND is_active = true',
       [userId]
@@ -64,8 +67,11 @@ export const getUserBusiness = async (req, res) => {
       data: result.rows[0] || null,
     });
   } catch (error) {
-    console.error('Get business error:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
+    console.error("Get user business error:", error); // 👈 IMPORTANT
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching business details",
+    });
   }
 };
 

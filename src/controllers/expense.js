@@ -33,6 +33,8 @@ export const getExpenseDetails = async (req, res) => {
   try {
     const { expense_id } = req.params;
 
+    console.log("Fetching details for expense ID:", expense_id);
+
     const expenseResult = await query(`
       SELECT e.id, e.description, e.total_amount, e.currency, e.paid_by,
              e.created_at, e.split_type, e.category_id,
