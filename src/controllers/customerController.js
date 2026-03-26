@@ -1,4 +1,40 @@
 import { query } from '../config/db.js';
+import cloudinary from 'cloudinary';
+import { v4 as uuidv4 } from 'uuid';
+
+cloudinary.v2.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+export const getUploadUrl = async (req, res) => {
+  try {
+    const { type, ext } = req.query;
+    if (!type || !ext) {
+      return res.status(400).json({ success: false, message: 'type and ext are required' });
+    }
+
+    const public_id = `attachments/${uuidv4()}`;
+
+    // return payload for client direct upload
+    return res.json({
+      success: true,
+      uploadUrl: null, // optional for compatibility; client uses direct Cloudinary endpoint
+      fileUrl: null,
+      cloudinary: {
+        url: 'https://api.cloudinary.com/v1_1/' + process.env.CLOUDINARY_CLOUD_NAME + '/auto/upload',
+        upload_preset: process.env.CLOUDINARY_UPLOAD_PRESET,
+        folder: process.env.CLOUDINARY_UPLOAD_FOLDER || 'splitbill',
+        public_id,
+      },
+    });
+
+  } catch (err) {
+    console.error('Get upload URL error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -190,7 +226,6 @@ export const getTransactions = async (req, res) => {
 
     const { customer_id } = req.params;
 
-    // verify customer belongs to this user
     const check = await query(
       'SELECT id FROM customers WHERE id = $1 AND user_id = $2 AND is_active = true',
       [customer_id, userId]
@@ -200,24 +235,27 @@ export const getTransactions = async (req, res) => {
     }
 
     const result = await query(
-      `SELECT * FROM ledger_transactions
+      `SELECT id, customer_id, user_id, business_id, type, amount, note,
+              transaction_date, attachments, created_at, updated_at
+       FROM ledger_transactions
        WHERE customer_id = $1
        ORDER BY created_at DESC`,
       [customer_id]
     );
 
-    // running balance (latest first, so we calculate from oldest)
     const rows = [...result.rows].reverse();
     let running = 0;
     const withBalance = rows.map(r => {
       running += r.type === 'gave' ? parseFloat(r.amount) : -parseFloat(r.amount);
-      return { ...r, amount: parseFloat(r.amount).toFixed(2), running_balance: running.toFixed(2) };
+      return {
+        ...r,
+        amount: parseFloat(r.amount).toFixed(2),
+        running_balance: running.toFixed(2),
+        attachments: r.attachments || '[]',
+      };
     });
 
-    res.json({
-      success: true,
-      data: withBalance.reverse(), // back to latest first
-    });
+    res.json({ success: true, data: withBalance.reverse() });
   } catch (error) {
     console.error('Get transactions error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -231,7 +269,7 @@ export const addTransaction = async (req, res) => {
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
     const { customer_id } = req.params;
-    const { type, amount, note } = req.body;
+    const { type, amount, note, transaction_date, attachments } = req.body;
 
     if (!['gave', 'got'].includes(type)) {
       return res.status(400).json({ success: false, message: "Type must be 'gave' or 'got'" });
@@ -240,7 +278,6 @@ export const addTransaction = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
     }
 
-    // verify customer belongs to this user
     const check = await query(
       'SELECT id, business_id FROM customers WHERE id = $1 AND user_id = $2 AND is_active = true',
       [customer_id, userId]
@@ -252,18 +289,87 @@ export const addTransaction = async (req, res) => {
     const businessId = check.rows[0].business_id;
 
     const result = await query(
-      `INSERT INTO ledger_transactions (business_id, customer_id, user_id, type, amount, note)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [businessId, customer_id, userId, type, parseFloat(amount), note || null]
+      `INSERT INTO ledger_transactions
+        (business_id, customer_id, user_id, type, amount, note, transaction_date, attachments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        businessId,
+        customer_id,
+        userId,
+        type,
+        parseFloat(amount),
+        note || null,
+        transaction_date || new Date(),
+        attachments || '[]',
+      ]
     );
 
     res.status(201).json({
       success: true,
       message: type === 'gave' ? 'Gave entry added' : 'Got entry added',
-      data: { ...result.rows[0], amount: parseFloat(result.rows[0].amount).toFixed(2) },
+      data: {
+        ...result.rows[0],
+        amount: parseFloat(result.rows[0].amount).toFixed(2),
+        attachments: result.rows[0].attachments || '[]',
+      },
     });
   } catch (error) {
     console.error('Add transaction error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+export const updateTransaction = async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+    const { transaction_id } = req.params;
+    const { type, amount, note, transaction_date, attachments } = req.body;
+
+    if (!['gave', 'got'].includes(type)) {
+      return res.status(400).json({ success: false, message: "Type must be 'gave' or 'got'" });
+    }
+    if (!amount || parseFloat(amount) <= 0) {
+      return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
+    }
+
+    const check = await query(
+      'SELECT id FROM ledger_transactions WHERE id = $1 AND user_id = $2',
+      [transaction_id, userId]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Transaction not found' });
+    }
+
+    const result = await query(
+      `UPDATE ledger_transactions
+       SET type=$1, amount=$2, note=$3, transaction_date=$4, attachments=$5, updated_at=NOW()
+       WHERE id=$6 AND user_id=$7
+       RETURNING *`,
+      [
+        type,
+        parseFloat(amount),
+        note || null,
+        transaction_date || new Date(),
+        attachments || '[]',
+        transaction_id,
+        userId,
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: 'Transaction updated successfully',
+      data: {
+        ...result.rows[0],
+        amount: parseFloat(result.rows[0].amount).toFixed(2),
+        attachments: result.rows[0].attachments || '[]',
+      },
+    });
+  } catch (error) {
+    console.error('Update transaction error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
