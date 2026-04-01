@@ -1,6 +1,7 @@
 import { query } from '../config/db.js';
 import cloudinary from 'cloudinary';
 import { v4 as uuidv4 } from 'uuid';
+import redis from '../config/redis.js';
 
 cloudinary.v2.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -8,6 +9,11 @@ cloudinary.v2.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// ── Cache key helpers ────────────────────────────────────────────────────────
+const customersKey = (userId) => `customers:${userId}`;
+const transactionsKey = (customerId) => `transactions:${customerId}`;
+
+// ── Upload URL ───────────────────────────────────────────────────────────────
 export const getUploadUrl = async (req, res) => {
   try {
     const { type, ext } = req.query;
@@ -17,10 +23,9 @@ export const getUploadUrl = async (req, res) => {
 
     const public_id = `attachments/${uuidv4()}`;
 
-    // return payload for client direct upload
     return res.json({
       success: true,
-      uploadUrl: null, // optional for compatibility; client uses direct Cloudinary endpoint
+      uploadUrl: null,
       fileUrl: null,
       cloudinary: {
         url: 'https://api.cloudinary.com/v1_1/' + process.env.CLOUDINARY_CLOUD_NAME + '/auto/upload',
@@ -29,16 +34,40 @@ export const getUploadUrl = async (req, res) => {
         public_id,
       },
     });
-
   } catch (err) {
     console.error('Get upload URL error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── Delete Cloudinary asset ──────────────────────────────────────────────────
+export const deleteCloudinaryAsset = async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
-// verify business belongs to user and return business_id
+    const { public_id } = req.body;
+    if (!public_id) {
+      return res.status(400).json({ success: false, message: 'public_id is required' });
+    }
+
+    const result = await cloudinary.v2.uploader.destroy(public_id, {
+      invalidate: true,
+      resource_type: 'auto',
+    });
+
+    if (result.result === 'ok' || result.result === 'not found') {
+      return res.json({ success: true, result: result.result });
+    }
+
+    return res.status(500).json({ success: false, message: `Cloudinary returned: ${result.result}` });
+  } catch (err) {
+    console.error('Delete Cloudinary asset error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ── Helper: get business ID for user ────────────────────────────────────────
 async function getBusinessId(userId) {
   const result = await query(
     'SELECT id FROM businesses WHERE user_id = $1 AND is_active = true',
@@ -51,7 +80,6 @@ async function getBusinessId(userId) {
 //  CUSTOMERS
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── Get all customers (with balance) ─────────────────────────────────────────
 export const getCustomers = async (req, res) => {
   try {
     const userId = req.user?.userId;
@@ -62,6 +90,15 @@ export const getCustomers = async (req, res) => {
       return res.status(404).json({ success: false, message: 'No business found. Please create a business first.' });
     }
 
+    const cacheKey = customersKey(userId);
+
+    // 1. Check Redis first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.json({ success: true, ...cached });
+    }
+
+    // 2. Cache miss — hit Postgres
     const result = await query(
       `SELECT
         c.id,
@@ -70,7 +107,6 @@ export const getCustomers = async (req, res) => {
         c.address,
         c.notes,
         c.created_at,
-        -- gave = customer owes you (positive), got = you owe customer (negative)
         COALESCE(SUM(CASE WHEN lt.type = 'gave' THEN lt.amount ELSE 0 END), 0) AS total_gave,
         COALESCE(SUM(CASE WHEN lt.type = 'got'  THEN lt.amount ELSE 0 END), 0) AS total_got,
         COALESCE(SUM(CASE WHEN lt.type = 'gave' THEN lt.amount ELSE -lt.amount END), 0) AS balance
@@ -82,7 +118,6 @@ export const getCustomers = async (req, res) => {
       [businessId]
     );
 
-    // overall summary
     const totalOweMe = result.rows
       .filter(r => parseFloat(r.balance) > 0)
       .reduce((sum, r) => sum + parseFloat(r.balance), 0);
@@ -91,28 +126,30 @@ export const getCustomers = async (req, res) => {
       .filter(r => parseFloat(r.balance) < 0)
       .reduce((sum, r) => sum + Math.abs(parseFloat(r.balance)), 0);
 
-    res.json({
-      success: true,
-      data: result.rows.map(r => ({
-        ...r,
-        total_gave: parseFloat(r.total_gave).toFixed(2),
-        total_got: parseFloat(r.total_got).toFixed(2),
-        balance: parseFloat(r.balance).toFixed(2),
-      })),
-      summary: {
-        total_customers: result.rows.length,
-        total_owe_me: parseFloat(totalOweMe).toFixed(2),   // customers owe you
-        total_i_owe: parseFloat(totalIOwe).toFixed(2),    // you owe customers
-        net_balance: parseFloat(totalOweMe - totalIOwe).toFixed(2),
-      },
-    });
+    const data = result.rows.map(r => ({
+      ...r,
+      total_gave: parseFloat(r.total_gave).toFixed(2),
+      total_got: parseFloat(r.total_got).toFixed(2),
+      balance: parseFloat(r.balance).toFixed(2),
+    }));
+
+    const summary = {
+      total_customers: result.rows.length,
+      total_owe_me: parseFloat(totalOweMe).toFixed(2),
+      total_i_owe: parseFloat(totalIOwe).toFixed(2),
+      net_balance: parseFloat(totalOweMe - totalIOwe).toFixed(2),
+    };
+
+    // 3. Store in Redis for 60 seconds
+    await redis.set(cacheKey, { data, summary }, { ex: 60 });
+
+    res.json({ success: true, data, summary });
   } catch (error) {
     console.error('Get customers error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 
-// ── Create customer ───────────────────────────────────────────────────────────
 export const createCustomer = async (req, res) => {
   try {
     const userId = req.user?.userId;
@@ -135,6 +172,9 @@ export const createCustomer = async (req, res) => {
       [businessId, userId, name.trim(), phone || null, address || null, notes || null]
     );
 
+    // Bust customers cache
+    await redis.del(customersKey(userId));
+
     res.status(201).json({
       success: true,
       message: 'Customer added successfully',
@@ -146,7 +186,6 @@ export const createCustomer = async (req, res) => {
   }
 };
 
-// ── Update customer ───────────────────────────────────────────────────────────
 export const updateCustomer = async (req, res) => {
   try {
     const userId = req.user?.userId;
@@ -175,6 +214,9 @@ export const updateCustomer = async (req, res) => {
       [name.trim(), phone || null, address || null, notes || null, customer_id, userId]
     );
 
+    // Bust customers cache
+    await redis.del(customersKey(userId));
+
     res.json({
       success: true,
       message: 'Customer updated successfully',
@@ -186,7 +228,6 @@ export const updateCustomer = async (req, res) => {
   }
 };
 
-// ── Delete customer (soft) ────────────────────────────────────────────────────
 export const deleteCustomer = async (req, res) => {
   try {
     const userId = req.user?.userId;
@@ -207,6 +248,9 @@ export const deleteCustomer = async (req, res) => {
       [customer_id, userId]
     );
 
+    // Bust customers cache
+    await redis.del(customersKey(userId));
+
     res.json({ success: true, message: 'Customer deleted successfully' });
   } catch (error) {
     console.error('Delete customer error:', error);
@@ -218,7 +262,6 @@ export const deleteCustomer = async (req, res) => {
 //  LEDGER TRANSACTIONS
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── Get all transactions for a customer ──────────────────────────────────────
 export const getTransactions = async (req, res) => {
   try {
     const userId = req.user?.userId;
@@ -234,6 +277,15 @@ export const getTransactions = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Customer not found' });
     }
 
+    const cacheKey = transactionsKey(customer_id);
+
+    // 1. Check Redis first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.json({ success: true, data: cached });
+    }
+
+    // 2. Cache miss — hit Postgres
     const result = await query(
       `SELECT id, customer_id, user_id, business_id, type, amount, note,
               transaction_date, attachments, created_at, updated_at
@@ -255,14 +307,18 @@ export const getTransactions = async (req, res) => {
       };
     });
 
-    res.json({ success: true, data: withBalance.reverse() });
+    const data = withBalance.reverse();
+
+    // 3. Store in Redis for 30 seconds
+    await redis.set(cacheKey, data, { ex: 30 });
+
+    res.json({ success: true, data });
   } catch (error) {
     console.error('Get transactions error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 
-// ── Add transaction ───────────────────────────────────────────────────────────
 export const addTransaction = async (req, res) => {
   try {
     const userId = req.user?.userId;
@@ -305,6 +361,12 @@ export const addTransaction = async (req, res) => {
       ]
     );
 
+    // Bust both caches — transaction list AND customer balance summary
+    await Promise.all([
+      redis.del(transactionsKey(customer_id)),
+      redis.del(customersKey(userId)),
+    ]);
+
     res.status(201).json({
       success: true,
       message: type === 'gave' ? 'Gave entry added' : 'Got entry added',
@@ -325,7 +387,7 @@ export const updateTransaction = async (req, res) => {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
-    const { transaction_id } = req.params;
+    const { transaction_id, customer_id } = req.params;
     const { type, amount, note, transaction_date, attachments } = req.body;
 
     if (!['gave', 'got'].includes(type)) {
@@ -359,6 +421,12 @@ export const updateTransaction = async (req, res) => {
       ]
     );
 
+    // Bust both caches
+    await Promise.all([
+      redis.del(transactionsKey(customer_id)),
+      redis.del(customersKey(userId)),
+    ]);
+
     res.json({
       success: true,
       message: 'Transaction updated successfully',
@@ -374,13 +442,12 @@ export const updateTransaction = async (req, res) => {
   }
 };
 
-// ── Delete transaction ────────────────────────────────────────────────────────
 export const deleteTransaction = async (req, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
-    const { transaction_id } = req.params;
+    const { transaction_id, customer_id } = req.params;
 
     const check = await query(
       'SELECT id FROM ledger_transactions WHERE id = $1 AND user_id = $2',
@@ -391,6 +458,12 @@ export const deleteTransaction = async (req, res) => {
     }
 
     await query('DELETE FROM ledger_transactions WHERE id = $1', [transaction_id]);
+
+    // Bust both caches
+    await Promise.all([
+      redis.del(transactionsKey(customer_id)),
+      redis.del(customersKey(userId)),
+    ]);
 
     res.json({ success: true, message: 'Transaction deleted successfully' });
   } catch (error) {

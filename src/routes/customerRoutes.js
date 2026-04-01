@@ -9,13 +9,18 @@ import {
   deleteTransaction,
   updateTransaction,
   getUploadUrl,
+  deleteCloudinaryAsset, // 👈 add this import
 } from '../controllers/customerController.js';
 import { authenticate } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// ── Upload URL (S3) ───────────────────────────────────────────────────────────
+// ── Upload URL ────────────────────────────────────────────────────────────────
 router.get('/upload-url', authenticate, getUploadUrl);
+
+// ── Cloudinary Delete ─────────────────────────────────────────────────────────
+router.delete('/cloudinary/delete', authenticate, deleteCloudinaryAsset); // 👈 add this
+
 // ── Customers ─────────────────────────────────────────────────────────────────
 router.get('/customers', authenticate, getCustomers);
 router.post('/customers', authenticate, createCustomer);

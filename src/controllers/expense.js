@@ -1,5 +1,15 @@
 import { query, pool } from "../config/db.js";
 import { notifyGroupMembers } from "../utils/notifyUsers.js";
+import redis from '../config/redis.js';
+
+// ─── Cache helpers ────────────────────────────────────────────────────────────
+const bustExpenseCache = async (groupId) => {
+  try {
+    if (groupId) await redis.del(`expenses:${groupId}`);
+  } catch (e) {
+    console.error('Redis bust error (expenses):', e);
+  }
+};
 
 // ─── Helper: get user name ────────────────────────────────────────────────────
 const getActorName = async (userId) => {
@@ -32,8 +42,6 @@ export const getGroupBalance = async (req, res) => {
 export const getExpenseDetails = async (req, res) => {
   try {
     const { expense_id } = req.params;
-
-    console.log("Fetching details for expense ID:", expense_id);
 
     const expenseResult = await query(`
       SELECT e.id, e.description, e.total_amount, e.currency, e.paid_by,
@@ -140,19 +148,15 @@ export const respondToSettlement = async (req, res) => {
       [newStatus, approverUserId, settlement_id]
     );
 
-    // ✅ On approval — update paid_share and cascade overpayment across group
     if (newStatus === 'approved' && settlement.expense_id) {
 
       await query(
-        `UPDATE expense_shares
-         SET paid_share = paid_share + $1
-         WHERE expense_id = $2 AND user_id = $3`,
+        `UPDATE expense_shares SET paid_share = paid_share + $1 WHERE expense_id = $2 AND user_id = $3`,
         [settlement.amount, settlement.expense_id, settlement.payer_user_id]
       );
 
       const shareRes = await query(
-        `SELECT owed_share, paid_share FROM expense_shares
-         WHERE expense_id = $1 AND user_id = $2`,
+        `SELECT owed_share, paid_share FROM expense_shares WHERE expense_id = $1 AND user_id = $2`,
         [settlement.expense_id, settlement.payer_user_id]
       );
 
@@ -180,15 +184,16 @@ export const respondToSettlement = async (req, res) => {
             const stillOwed = parseFloat(row.owed_share) - parseFloat(row.paid_share);
             const toApply = Math.min(remaining, stillOwed);
             await query(
-              `UPDATE expense_shares
-               SET paid_share = paid_share + $1
-               WHERE expense_id = $2 AND user_id = $3`,
+              `UPDATE expense_shares SET paid_share = paid_share + $1 WHERE expense_id = $2 AND user_id = $3`,
               [toApply, row.expense_id, settlement.payer_user_id]
             );
             remaining -= toApply;
           }
         }
       }
+
+      // Bust expense cache for the group
+      await bustExpenseCache(settlement.group_id);
     }
 
     await query(
@@ -198,7 +203,6 @@ export const respondToSettlement = async (req, res) => {
       `${newStatus} settlement of $${settlement.amount}`, settlement.amount, 'USD']
     );
 
-    // ─── Push notification for settlement response ─────────────────────────
     try {
       const actorName = await getActorName(approverUserId);
       await notifyGroupMembers({
@@ -259,8 +263,7 @@ export const addExpense = async (req, res) => {
 
     for (const share of owedShares) {
       await query(
-        `INSERT INTO expense_shares (expense_id, user_id, owed_share, paid_share)
-         VALUES ($1, $2, $3, $4)`,
+        `INSERT INTO expense_shares (expense_id, user_id, owed_share, paid_share) VALUES ($1, $2, $3, $4)`,
         [expenseId, share.user_id, share.owed_share, share.paid_share]
       );
     }
@@ -271,7 +274,8 @@ export const addExpense = async (req, res) => {
       [group_id, req.user.userId, 'expense_added', `Added expense: ${description}`, total_amount, currency || 'USD', expenseId]
     );
 
-    // ─── Push notification for expense added ──────────────────────────────
+    await bustExpenseCache(group_id);
+
     try {
       const actorName = await getActorName(req.user.userId);
       await notifyGroupMembers({
@@ -293,7 +297,7 @@ export const addExpense = async (req, res) => {
   }
 };
 
-// ─── Get Expenses By User ─────────────────────────────────────────────────────
+// ─── Get Expenses By User (not cached — cross-group, invalidation too complex) ─
 export const getExpensesByUser = async (req, res) => {
   try {
     const { user_id } = req.params;
@@ -314,10 +318,21 @@ export const getExpensesByUser = async (req, res) => {
   }
 };
 
-// ─── Get Expenses By Group ────────────────────────────────────────────────────
+// ─── Get Expenses By Group (cached) ──────────────────────────────────────────
 export const getExpensesByGroup = async (req, res) => {
   try {
     const { group_id } = req.params;
+    const cacheKey = `expenses:${group_id}`;
+
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ success: true, data: cached, fromCache: true });
+      }
+    } catch (e) {
+      console.error('Redis get error (getExpensesByGroup):', e);
+    }
+
     const result = await query(
       `SELECT e.id, e.description, e.total_amount AS amount, e.currency, e.paid_by,
               u.name AS paid_by_name, e.category_id, e.created_at AS date,
@@ -329,6 +344,13 @@ export const getExpensesByGroup = async (req, res) => {
        ORDER BY e.created_at DESC`,
       [group_id]
     );
+
+    try {
+      await redis.set(cacheKey, result.rows, { ex: 30 });
+    } catch (e) {
+      console.error('Redis set error (getExpensesByGroup):', e);
+    }
+
     res.json({ success: true, data: result.rows });
   } catch (error) {
     console.error('Error fetching group expenses:', error);
@@ -356,7 +378,8 @@ export const deleteExpense = async (req, res) => {
 
     await query(`UPDATE expenses SET is_deleted = true, updated_at = NOW() WHERE id = $1`, [expenseId]);
 
-    // ─── Push notification for expense deleted ────────────────────────────
+    await bustExpenseCache(groupId);
+
     try {
       const actorName = await getActorName(requesterId);
       await notifyGroupMembers({
@@ -398,7 +421,8 @@ export const updateExpense = async (req, res) => {
       [description, total_amount, currency || 'USD', category_id, expense_id]
     );
 
-    // ─── Push notification for expense updated ────────────────────────────
+    await bustExpenseCache(groupId);
+
     try {
       const actorName = await getActorName(requesterId);
       await notifyGroupMembers({
@@ -442,7 +466,7 @@ export const requestSettlement = async (req, res) => {
       [payer_user_id, payee_user_id, expense_id || null]
     );
     if (duplicate.rows.length > 0) {
-      return res.status(400).json({ success: false, message: 'You already have a pending settlement request for this expense. Wait for it to be approved or rejected.' });
+      return res.status(400).json({ success: false, message: 'You already have a pending settlement request for this expense.' });
     }
 
     const result = await query(
@@ -459,7 +483,9 @@ export const requestSettlement = async (req, res) => {
       [group_id, payer_user_id, 'settlement_requested', `Requested settlement with user ${payee_user_id}`, amount, 'USD']
     );
 
-    // ─── Push notification for settlement request ─────────────────────────
+    // Bust expense cache since settlement changes the balance picture
+    await bustExpenseCache(group_id);
+
     try {
       const actorName = await getActorName(req.user.userId);
       await notifyGroupMembers({
@@ -481,9 +507,10 @@ export const requestSettlement = async (req, res) => {
     res.status(500).json({ success: false, message: 'Error requesting settlement' });
   }
 };
+
 // ─── Get Notifications ────────────────────────────────────────────────────────
 export const getNotifications = async (req, res) => {
-  const client = await pool.connect(); // grab ONE dedicated connection
+  const client = await pool.connect();
   try {
     const userId = req.user.userId;
 
@@ -512,9 +539,10 @@ export const getNotifications = async (req, res) => {
     console.error('Get notifications error:', err);
     res.status(500).json({ success: false, message: 'Server error' });
   } finally {
-    client.release(); // ALWAYS release back to pool
+    client.release();
   }
 };
+
 // ─── Mark Notifications Read ──────────────────────────────────────────────────
 export const markNotificationsRead = async (req, res) => {
   try {

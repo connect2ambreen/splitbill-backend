@@ -1,11 +1,24 @@
 import { query } from "../config/db.js";
 import { generateUniqueInviteCode } from "../utils/inviteCode.js";
 import { notifyGroupMembers, notifyInvitation, notifyInvitationAccepted } from "../utils/notifyUsers.js";
-import { sendEmail } from '../utils/emailService.js'; // Update path to your email file
+import { sendEmail } from '../utils/emailService.js';
+import redis from '../config/redis.js';
 
 import crypto from 'crypto';
 
+// ─── Cache helpers ────────────────────────────────────────────────────────────
+const bustGroupCaches = async (userId, groupId) => {
+  try {
+    const keys = [];
+    if (userId) keys.push(`groups:${userId}`);
+    if (groupId) keys.push(`group_members:${groupId}`, `group_detail:${groupId}`);
+    if (keys.length) await Promise.all(keys.map(k => redis.del(k)));
+  } catch (e) {
+    console.error('Redis bust error:', e);
+  }
+};
 
+// ─── Create Group ─────────────────────────────────────────────────────────────
 export const createGroup = async (req, res) => {
   try {
     const userId = req.user?.userId;
@@ -33,6 +46,8 @@ export const createGroup = async (req, res) => {
        VALUES ($1, $2, 'admin')`,
       [group.id, userId]
     );
+
+    await bustGroupCaches(userId, group.id);
 
     res.status(201).json({
       success: true,
@@ -110,7 +125,6 @@ export const inviteToGroup = async (req, res) => {
       );
     }
 
-    // ── Notify invited user if they exist in the system ───────────────────
     if (invitee) {
       const inviterResult = await query('SELECT name FROM users WHERE id = $1', [inviterUserId]);
       const inviterName = inviterResult.rows[0]?.name || 'Someone';
@@ -188,7 +202,8 @@ export const acceptInvitation = async (req, res) => {
       ['accepted', userId, invitation.id]
     );
 
-    // ── Notify group members that someone joined ──────────────────────────
+    await bustGroupCaches(userId, invitation.group_id);
+
     await notifyInvitationAccepted({
       new_member_id: userId,
       group_id: invitation.group_id,
@@ -293,7 +308,6 @@ export const verifyInvitation = async (req, res) => {
 };
 
 
-
 export const getPendingInvitations = async (req, res) => {
   try {
     const userId = req.user && req.user.userId;
@@ -347,10 +361,20 @@ export const getPendingInvitations = async (req, res) => {
 };
 
 
-
+// ─── Get User Groups (cached) ─────────────────────────────────────────────────
 export const getUserGroups = async (req, res) => {
   try {
     const { user_id } = req.params;
+    const cacheKey = `groups:${user_id}`;
+
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ success: true, data: cached, fromCache: true });
+      }
+    } catch (e) {
+      console.error('Redis get error (getUserGroups):', e);
+    }
 
     const groupsQuery = `
       SELECT 
@@ -402,10 +426,13 @@ export const getUserGroups = async (req, res) => {
       you_owe: parseFloat(group.you_owe || 0),
     }));
 
-    res.json({
-      success: true,
-      data: groups,
-    });
+    try {
+      await redis.set(cacheKey, groups, { ex: 60 });
+    } catch (e) {
+      console.error('Redis set error (getUserGroups):', e);
+    }
+
+    res.json({ success: true, data: groups });
 
   } catch (error) {
     console.error('Get user groups error:', error);
@@ -418,11 +445,21 @@ export const getUserGroups = async (req, res) => {
 };
 
 
-
+// ─── Get Group Members (cached) ───────────────────────────────────────────────
 export const getGroupMembers = async (req, res) => {
   console.log('🔥 getGroupMembers HIT', req.params, req.user);
   try {
     const { group_id } = req.params;
+    const cacheKey = `group_members:${group_id}`;
+
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ success: true, data: cached, fromCache: true });
+      }
+    } catch (e) {
+      console.error('Redis get error (getGroupMembers):', e);
+    }
 
     const membersQuery = `
       SELECT 
@@ -443,10 +480,13 @@ export const getGroupMembers = async (req, res) => {
 
     const result = await query(membersQuery, [group_id]);
 
-    res.json({
-      success: true,
-      data: result.rows
-    });
+    try {
+      await redis.set(cacheKey, result.rows, { ex: 120 });
+    } catch (e) {
+      console.error('Redis set error (getGroupMembers):', e);
+    }
+
+    res.json({ success: true, data: result.rows });
 
   } catch (error) {
     console.error('Get group members error:', error);
@@ -459,7 +499,6 @@ export const getGroupMembers = async (req, res) => {
 };
 
 
-
 export const getAllUsers = async (req, res) => {
   try {
     const result = await query(`
@@ -468,20 +507,13 @@ export const getAllUsers = async (req, res) => {
       ORDER BY name ASC
     `);
 
-    res.json({
-      success: true,
-      data: result.rows
-    });
+    res.json({ success: true, data: result.rows });
 
   } catch (error) {
     console.error('Get all users error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch users'
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch users' });
   }
 };
-
 
 
 export const addUsersToGroup = async (req, res) => {
@@ -490,15 +522,11 @@ export const addUsersToGroup = async (req, res) => {
     const { user_ids } = req.body;
 
     if (!user_ids || user_ids.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No users selected'
-      });
+      return res.status(400).json({ success: false, message: 'No users selected' });
     }
 
     const groupId = parseInt(group_id);
 
-    // Check which users are already members
     const existingMembers = await query(
       'SELECT user_id FROM group_members WHERE group_id = $1 AND user_id = ANY($2)',
       [groupId, user_ids]
@@ -508,13 +536,9 @@ export const addUsersToGroup = async (req, res) => {
     const newUserIds = user_ids.filter(id => !existingIds.includes(id));
 
     if (newUserIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'All selected users are already members'
-      });
+      return res.status(400).json({ success: false, message: 'All selected users are already members' });
     }
 
-    // Add new members to group
     for (const userId of newUserIds) {
       await query(
         'INSERT INTO group_members (group_id, user_id, role) VALUES ($1, $2, $3)',
@@ -522,21 +546,17 @@ export const addUsersToGroup = async (req, res) => {
       );
     }
 
+    await bustGroupCaches(null, groupId);
+
     res.json({
       success: true,
       message: `Successfully added ${newUserIds.length} members to the group`,
-      data: {
-        added_count: newUserIds.length,
-        existing_count: existingIds.length
-      }
+      data: { added_count: newUserIds.length, existing_count: existingIds.length }
     });
 
   } catch (error) {
     console.error('Add users to group error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error while adding members'
-    });
+    res.status(500).json({ success: false, message: 'Server error while adding members' });
   }
 };
 
@@ -566,11 +586,7 @@ export const getGroupBalance = async (req, res) => {
 
   } catch (error) {
     console.error('Get group balance error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch group balance',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch group balance', error: error.message });
   }
 };
 
@@ -579,13 +595,11 @@ export const getGroupSummary = async (req, res) => {
     const { group_id } = req.params;
     const userId = req.user.userId;
 
-    // Total spent in group (sum of total_amount of non-deleted expenses)
     const totalRes = await query(
       `SELECT COALESCE(SUM(total_amount),0) AS total_spent FROM expenses WHERE group_id = $1 AND is_deleted = false`,
       [group_id]
     );
 
-    // Reuse balance calculation for the current user
     const balanceRes = await query(`
       SELECT
         SUM(CASE WHEN es.owed_share > es.paid_share THEN es.owed_share - es.paid_share ELSE 0 END) AS you_owe,
@@ -595,7 +609,6 @@ export const getGroupSummary = async (req, res) => {
       WHERE e.group_id = $1 AND es.user_id = $2 AND e.is_deleted = false
     `, [group_id, userId]);
 
-    // Get few recent expenses
     const recentRes = await query(
       `SELECT e.id, e.description, e.total_amount AS amount, e.currency, e.paid_by, u.name AS paid_by_name, e.created_at AS date
        FROM expenses e
@@ -630,41 +643,27 @@ export const leaveGroup = async (req, res) => {
     console.log('=== LEAVE GROUP REQUEST ===');
     const { group_id } = req.params;
     const userId = req.user.userId;
-    console.log('Group ID:', group_id);
-    console.log('User ID:', userId);
 
     const groupId = parseInt(group_id);
 
-    // Check if user is a member
-    console.log('Checking if user is a member...');
     const memberCheck = await query(
       'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
       [groupId, userId]
     );
-    console.log('Member check result:', memberCheck.rows);
 
     if (memberCheck.rows.length === 0) {
-      console.log('❌ User is not a member of this group');
-      return res.status(404).json({
-        success: false,
-        message: 'You are not a member of this group'
-      });
+      return res.status(404).json({ success: false, message: 'You are not a member of this group' });
     }
 
     const userRole = memberCheck.rows[0].role;
-    console.log('User role:', userRole);
 
-    // Prevent admin from leaving if there are other members
     if (userRole === 'admin') {
-      console.log('User is admin, checking member count...');
       const memberCount = await query(
         'SELECT COUNT(*) as count FROM group_members WHERE group_id = $1 AND is_active = true',
         [groupId]
       );
-      console.log('Active member count:', memberCount.rows[0].count);
 
       if (parseInt(memberCount.rows[0].count) > 1) {
-        console.log('❌ Admin cannot leave group with other members');
         return res.status(400).json({
           success: false,
           message: 'As the admin, you must delete the group or transfer ownership before leaving'
@@ -672,8 +671,6 @@ export const leaveGroup = async (req, res) => {
       }
     }
 
-    // Calculate user's balance in the group
-    console.log('Calculating user balance...');
     const balanceResult = await query(`
       SELECT 
         COALESCE(SUM(CASE WHEN es.user_id = $2 THEN es.owed_share ELSE 0 END), 0) as total_owed_to_user,
@@ -682,45 +679,25 @@ export const leaveGroup = async (req, res) => {
       JOIN expenses e ON es.expense_id = e.id
       WHERE e.group_id = $1 AND e.is_deleted = false
     `, [groupId, userId]);
-    console.log('Balance result:', balanceResult.rows);
 
     const totalOwedByUser = parseFloat(balanceResult.rows[0].total_owed_to_user || 0);
     const totalPaidByUser = parseFloat(balanceResult.rows[0].total_paid_by_user || 0);
     const netBalance = totalPaidByUser - totalOwedByUser;
 
-    console.log('Total owed by user:', totalOwedByUser);
-    console.log('Total paid by user:', totalPaidByUser);
-    console.log('Net balance:', netBalance);
-
-    // Get user details for email
-    console.log('Fetching user details...');
-    const userDetails = await query(
-      'SELECT email, name FROM users WHERE id = $1',
-      [userId]
-    );
-    console.log('User details:', userDetails.rows);
-
+    const userDetails = await query('SELECT email, name FROM users WHERE id = $1', [userId]);
     const userEmail = userDetails.rows[0].email;
     const userName = userDetails.rows[0].name;
 
-    // Get group name
-    console.log('Fetching group details...');
-    const groupDetails = await query(
-      'SELECT name FROM groups WHERE id = $1',
-      [groupId]
-    );
-    console.log('Group details:', groupDetails.rows);
+    const groupDetails = await query('SELECT name FROM groups WHERE id = $1', [groupId]);
     const groupName = groupDetails.rows[0].name;
 
-    // Remove user from group (soft delete)
-    console.log('Removing user from group...');
     await query(
       'UPDATE group_members SET is_active = false WHERE group_id = $1 AND user_id = $2',
       [groupId, userId]
     );
-    console.log('✅ User removed from group');
 
-    // Send email with balance information
+    await bustGroupCaches(userId, groupId);
+
     let balanceMessage = '';
     if (netBalance > 0) {
       balanceMessage = `You are owed $${netBalance.toFixed(2)} from other members in the group.`;
@@ -729,10 +706,7 @@ export const leaveGroup = async (req, res) => {
     } else {
       balanceMessage = 'All your expenses are settled.';
     }
-    console.log('Balance message:', balanceMessage);
 
-    // Get detailed breakdown of who owes whom
-    console.log('Fetching detailed balance breakdown...');
     const detailedBalances = await query(`
       SELECT 
         u.name,
@@ -747,7 +721,6 @@ export const leaveGroup = async (req, res) => {
       GROUP BY u.id, u.name, u.email
       HAVING SUM(es.owed_share - es.paid_share) != 0
     `, [groupId, userId]);
-    console.log('Detailed balances:', detailedBalances.rows);
 
     let detailedBreakdown = '';
     if (detailedBalances.rows.length > 0) {
@@ -761,9 +734,7 @@ export const leaveGroup = async (req, res) => {
         }
       });
     }
-    console.log('Detailed breakdown text:', detailedBreakdown);
 
-    // Prepare email content
     const emailContent = {
       to: userEmail,
       subject: `You've left "${groupName}" - Expense Summary`,
@@ -771,44 +742,24 @@ export const leaveGroup = async (req, res) => {
         <h2>You've left the group "${groupName}"</h2>
         <p>Hi ${userName},</p>
         <p>You have successfully left the group <strong>${groupName}</strong>.</p>
-        
         <h3>Your Final Balance:</h3>
         <p><strong>${balanceMessage}</strong></p>
-        
         ${detailedBreakdown ? `<pre style="background: #f5f5f5; padding: 15px; border-radius: 5px;">${detailedBreakdown}</pre>` : ''}
-        
         ${netBalance !== 0 ? `
           <p style="background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
             <strong>⚠️ Important:</strong> Please settle your outstanding balances with other group members directly.
           </p>
         ` : ''}
-        
         <p>Thank you for using our expense tracking app!</p>
       `
     };
 
-    console.log('📧 Preparing to send email to:', userEmail);
-    console.log('Email subject:', emailContent.subject);
-
-    // Send email notification
     try {
-      console.log('Calling sendEmail function...');
-      const emailResult = await sendEmail(emailContent);
-      console.log('Email result:', emailResult);
-      if (emailResult.success) {
-        console.log('✅ Email sent successfully');
-      } else {
-        console.log('⚠️ Email sending returned failure but continuing...');
-      }
+      await sendEmail(emailContent);
     } catch (emailError) {
-      console.error('❌ Email sending failed:', emailError);
-      console.error('Email error details:', emailError.message);
-      console.error('Email error stack:', emailError.stack);
-      // Don't fail the request if email fails
+      console.error('Email sending failed:', emailError);
     }
 
-    // Notify remaining group members
-    console.log('Notifying remaining group members...');
     try {
       await notifyGroupMembers({
         group_id: groupId,
@@ -817,12 +768,10 @@ export const leaveGroup = async (req, res) => {
         title: 'Member Left Group',
         message: `${userName} has left the group`
       });
-      console.log('✅ Group members notified');
     } catch (notifyError) {
-      console.error('❌ Notification failed:', notifyError);
+      console.error('Notification failed:', notifyError);
     }
 
-    console.log('=== LEAVE GROUP SUCCESSFUL ===');
     res.json({
       success: true,
       message: 'You have successfully left the group',
@@ -835,95 +784,50 @@ export const leaveGroup = async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ LEAVE GROUP ERROR:', error);
-    console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({
-      success: false,
-      message: 'Server error while leaving group'
-    });
+    console.error('LEAVE GROUP ERROR:', error);
+    res.status(500).json({ success: false, message: 'Server error while leaving group' });
   }
 };
 
 
 export const deleteGroup = async (req, res) => {
   try {
-    console.log('=== DELETE GROUP REQUEST ===');
     const { group_id } = req.params;
     const userId = req.user.userId;
-    console.log('Group ID:', group_id);
-    console.log('User ID:', userId);
-
     const groupId = parseInt(group_id);
 
-    // Check if user is admin
-    console.log('Checking if user is admin...');
     const memberCheck = await query(
       'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
       [groupId, userId]
     );
-    console.log('Member check result:', memberCheck.rows);
 
     if (memberCheck.rows.length === 0) {
-      console.log('❌ Group not found or user not a member');
-      return res.status(404).json({
-        success: false,
-        message: 'Group not found or you are not a member'
-      });
+      return res.status(404).json({ success: false, message: 'Group not found or you are not a member' });
     }
 
     if (memberCheck.rows[0].role !== 'admin') {
-      console.log('❌ User is not admin, role:', memberCheck.rows[0].role);
-      return res.status(403).json({
-        success: false,
-        message: 'Only the admin can delete this group'
-      });
+      return res.status(403).json({ success: false, message: 'Only the admin can delete this group' });
     }
 
-    console.log('✅ User is admin, proceeding with deletion');
-
-    // Get group name for notifications
-    console.log('Fetching group details...');
-    const groupDetails = await query(
-      'SELECT name FROM groups WHERE id = $1',
-      [groupId]
-    );
-    console.log('Group details:', groupDetails.rows);
-
+    const groupDetails = await query('SELECT name FROM groups WHERE id = $1', [groupId]);
     if (groupDetails.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Group not found'
-      });
+      return res.status(404).json({ success: false, message: 'Group not found' });
     }
 
     const groupName = groupDetails.rows[0].name;
 
-    // Get all active members
-    console.log('Fetching all active members...');
     const members = await query(`
-      SELECT DISTINCT
-        u.id,
-        u.email,
-        u.name
+      SELECT DISTINCT u.id, u.email, u.name
       FROM group_members gm
       JOIN users u ON gm.user_id = u.id
       WHERE gm.group_id = $1 AND gm.is_active = true
     `, [groupId]);
 
-    console.log('Found members:', members.rows.length);
-    console.log('Members data:', members.rows);
-
-    // Calculate balances for each member and send emails
-    console.log('Calculating balances and sending emails to all members...');
     let emailsSent = 0;
     let emailsFailed = 0;
 
     for (const member of members.rows) {
-      console.log(`\n--- Processing member: ${member.name} (${member.email}) ---`);
-
       try {
-        // Calculate balance for this member
         const balanceResult = await query(`
           SELECT 
             COALESCE(SUM(es.owed_share), 0) as total_owed_by_user,
@@ -937,10 +841,6 @@ export const deleteGroup = async (req, res) => {
         const totalPaidByUser = parseFloat(balanceResult.rows[0].total_paid_by_user || 0);
         const netBalance = totalPaidByUser - totalOwedByUser;
 
-        console.log(`  Total owed by ${member.name}:`, totalOwedByUser);
-        console.log(`  Total paid by ${member.name}:`, totalPaidByUser);
-        console.log(`  Net balance:`, netBalance);
-
         let balanceMessage = '';
         if (netBalance > 0) {
           balanceMessage = `You are owed $${netBalance.toFixed(2)} from other members.`;
@@ -949,7 +849,6 @@ export const deleteGroup = async (req, res) => {
         } else {
           balanceMessage = 'All your expenses are settled.';
         }
-        console.log(`  Balance message:`, balanceMessage);
 
         const emailContent = {
           to: member.email,
@@ -958,58 +857,30 @@ export const deleteGroup = async (req, res) => {
             <h2>Group "${groupName}" has been deleted</h2>
             <p>Hi ${member.name},</p>
             <p>The group <strong>${groupName}</strong> has been deleted by the admin.</p>
-            
             <h3>Your Final Balance:</h3>
             <p><strong>${balanceMessage}</strong></p>
-            
             ${netBalance !== 0 ? `
               <p style="background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
                 <strong>⚠️ Important:</strong> Please settle your outstanding balances with other group members directly.
               </p>
             ` : ''}
-            
             <p>Thank you for using our expense tracking app!</p>
           `
         };
 
-        console.log(`  📧 Sending email to: ${member.email}`);
         const emailResult = await sendEmail(emailContent);
-        console.log(`  Email result:`, emailResult);
-
-        if (emailResult.success) {
-          console.log(`  ✅ Email sent successfully to ${member.name}`);
-          emailsSent++;
-        } else {
-          console.log(`  ⚠️ Email sending returned failure for ${member.name}`);
-          emailsFailed++;
-        }
+        if (emailResult.success) emailsSent++; else emailsFailed++;
       } catch (emailError) {
-        console.error(`  ❌ Failed to send email to ${member.name}:`, emailError);
-        console.error(`  Email error message:`, emailError.message);
+        console.error(`Failed to send email to ${member.name}:`, emailError);
         emailsFailed++;
-        // Continue with other members even if one email fails
       }
     }
 
-    console.log(`\n📊 Email Summary: ${emailsSent} sent, ${emailsFailed} failed out of ${members.rows.length} total`);
+    await query('UPDATE groups SET is_active = false WHERE id = $1', [groupId]);
+    await query('UPDATE group_members SET is_active = false WHERE group_id = $1', [groupId]);
 
-    // Soft delete the group
-    console.log('\nSoft deleting the group...');
-    await query(
-      'UPDATE groups SET is_active = false WHERE id = $1',
-      [groupId]
-    );
-    console.log('✅ Group soft deleted');
+    await bustGroupCaches(userId, groupId);
 
-    // Soft delete all group members
-    console.log('Soft deleting all group members...');
-    await query(
-      'UPDATE group_members SET is_active = false WHERE group_id = $1',
-      [groupId]
-    );
-    console.log('✅ All group members soft deleted');
-
-    console.log('=== DELETE GROUP SUCCESSFUL ===');
     res.json({
       success: true,
       message: emailsSent > 0
@@ -1018,9 +889,7 @@ export const deleteGroup = async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ DELETE GROUP ERROR:', error);
-    console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
+    console.error('DELETE GROUP ERROR:', error);
     res.status(500).json({
       success: false,
       message: 'Server error while deleting group',
@@ -1030,27 +899,28 @@ export const deleteGroup = async (req, res) => {
 };
 
 
-
+// ─── Get Group Details (cached) ───────────────────────────────────────────────
 export const getGroupDetails = async (req, res) => {
   try {
     const { group_id } = req.params;
     const userId = req.user.userId;
-
     const groupId = parseInt(group_id);
+    const cacheKey = `group_detail:${groupId}`;
 
-    // Get group info
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json({ success: true, data: cached, fromCache: true });
+      }
+    } catch (e) {
+      console.error('Redis get error (getGroupDetails):', e);
+    }
+
     const groupQuery = `
       SELECT 
-        g.id,
-        g.name,
-        g.description,
-        g.group_type,
-        g.default_currency,
-        g.avatar_url,
-        g.invite_code,
-        g.created_at,
-        u.name as created_by_name,
-        u.id as created_by_id
+        g.id, g.name, g.description, g.group_type, g.default_currency,
+        g.avatar_url, g.invite_code, g.created_at,
+        u.name as created_by_name, u.id as created_by_id
       FROM groups g
       LEFT JOIN users u ON g.created_by = u.id
       WHERE g.id = $1 AND g.is_active = true
@@ -1059,29 +929,18 @@ export const getGroupDetails = async (req, res) => {
     const groupResult = await query(groupQuery, [groupId]);
 
     if (groupResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Group not found'
-      });
+      return res.status(404).json({ success: false, message: 'Group not found' });
     }
 
-    // Get member count
-    const memberCountQuery = `
-      SELECT COUNT(*) as member_count
-      FROM group_members
-      WHERE group_id = $1 AND is_active = true
-    `;
+    const memberCountResult = await query(
+      'SELECT COUNT(*) as member_count FROM group_members WHERE group_id = $1 AND is_active = true',
+      [groupId]
+    );
 
-    const memberCountResult = await query(memberCountQuery, [groupId]);
-
-    // Get user's role in the group
-    const userRoleQuery = `
-      SELECT role
-      FROM group_members
-      WHERE group_id = $1 AND user_id = $2 AND is_active = true
-    `;
-
-    const userRoleResult = await query(userRoleQuery, [groupId, userId]);
+    const userRoleResult = await query(
+      'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
+      [groupId, userId]
+    );
 
     const groupData = {
       ...groupResult.rows[0],
@@ -1089,18 +948,17 @@ export const getGroupDetails = async (req, res) => {
       user_role: userRoleResult.rows.length > 0 ? userRoleResult.rows[0].role : null
     };
 
-    res.json({
-      success: true,
-      data: groupData
-    });
+    try {
+      await redis.set(cacheKey, groupData, { ex: 120 });
+    } catch (e) {
+      console.error('Redis set error (getGroupDetails):', e);
+    }
+
+    res.json({ success: true, data: groupData });
 
   } catch (error) {
     console.error('Get group details error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch group details',
-      error: error.message
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch group details', error: error.message });
   }
 };
 
@@ -1110,62 +968,41 @@ export const updateGroup = async (req, res) => {
     const { group_id } = req.params;
     const userId = req.user.userId;
     const { name, description } = req.body;
-
     const groupId = parseInt(group_id);
 
-    // Validate input
     if (!name || !name.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Group name is required'
-      });
+      return res.status(400).json({ success: false, message: 'Group name is required' });
     }
 
-    // Check if user is admin of the group
     const memberCheck = await query(
       'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
       [groupId, userId]
     );
 
     if (memberCheck.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Group not found or you are not a member'
-      });
+      return res.status(404).json({ success: false, message: 'Group not found or you are not a member' });
     }
 
     if (memberCheck.rows[0].role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only the admin can edit group details'
-      });
+      return res.status(403).json({ success: false, message: 'Only the admin can edit group details' });
     }
 
-    // Update the group
     const updateResult = await query(
       'UPDATE groups SET name = $1, description = $2, updated_at = NOW() WHERE id = $3 RETURNING *',
       [name.trim(), description ? description.trim() : null, groupId]
     );
 
     if (updateResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Group not found'
-      });
+      return res.status(404).json({ success: false, message: 'Group not found' });
     }
 
-    res.json({
-      success: true,
-      message: 'Group updated successfully',
-      data: updateResult.rows[0]
-    });
+    await bustGroupCaches(userId, groupId);
+
+    res.json({ success: true, message: 'Group updated successfully', data: updateResult.rows[0] });
 
   } catch (error) {
     console.error('Update group error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error while updating group'
-    });
+    res.status(500).json({ success: false, message: 'Server error while updating group' });
   }
 };
 
@@ -1176,78 +1013,48 @@ export const declineInvitation = async (req, res) => {
     const userId = req.user && req.user.userId;
 
     if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Authentication required'
-      });
+      return res.status(401).json({ success: false, message: 'Authentication required' });
     }
 
-    // Find the invitation
     const invResult = await query(
       'SELECT * FROM group_invitations WHERE invitation_token = $1',
       [token]
     );
 
     if (invResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Invitation not found'
-      });
+      return res.status(404).json({ success: false, message: 'Invitation not found' });
     }
 
     const invitation = invResult.rows[0];
 
-    // Check if already processed
     if (invitation.status !== 'pending') {
-      return res.status(400).json({
-        success: false,
-        message: `Invitation is already ${invitation.status}`
-      });
+      return res.status(400).json({ success: false, message: `Invitation is already ${invitation.status}` });
     }
 
-    // Verify the invitation is for this user
     if (invitation.user_id && invitation.user_id !== userId) {
-      return res.status(403).json({
-        success: false,
-        message: 'This invitation was not issued for your account'
-      });
+      return res.status(403).json({ success: false, message: 'This invitation was not issued for your account' });
     }
 
     if (!invitation.user_id) {
-      // Verify by email
       const userResult = await query('SELECT email FROM users WHERE id = $1', [userId]);
       const currentEmail = userResult.rows[0]?.email;
 
       if (invitation.invitee_email && currentEmail &&
         invitation.invitee_email.toLowerCase() !== currentEmail.toLowerCase()) {
-        return res.status(403).json({
-          success: false,
-          message: 'This invitation email does not match your account email'
-        });
+        return res.status(403).json({ success: false, message: 'This invitation email does not match your account email' });
       }
     }
 
-    // Update invitation status to declined
     await query(
-      `UPDATE group_invitations 
-       SET status = 'declined', 
-           declined_at = NOW(), 
-           user_id = $1 
-       WHERE id = $2`,
+      `UPDATE group_invitations SET status = 'declined', declined_at = NOW(), user_id = $1 WHERE id = $2`,
       [userId, invitation.id]
     );
 
-    res.json({
-      success: true,
-      message: 'Invitation declined successfully'
-    });
+    res.json({ success: true, message: 'Invitation declined successfully' });
 
   } catch (error) {
     console.error('Decline invitation error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Server error during invitation decline.'
-    });
+    res.status(500).json({ success: false, message: 'Server error during invitation decline.' });
   }
 };
 
@@ -1256,11 +1063,9 @@ export const removeMember = async (req, res) => {
   try {
     const { group_id, user_id } = req.params;
     const requesterId = req.user.userId;
-
     const groupId = parseInt(group_id);
     const targetUserId = parseInt(user_id);
 
-    // Requester must be admin
     const requesterCheck = await query(
       'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
       [groupId, requesterId]
@@ -1273,12 +1078,10 @@ export const removeMember = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only the admin can remove members' });
     }
 
-    // Cannot remove yourself — use leaveGroup for that
     if (targetUserId === requesterId) {
       return res.status(400).json({ success: false, message: 'Use Leave Group to remove yourself' });
     }
 
-    // Target must be an active member
     const targetCheck = await query(
       'SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2 AND is_active = true',
       [groupId, targetUserId]
@@ -1288,19 +1091,13 @@ export const removeMember = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Member not found in this group' });
     }
 
-    // Cannot remove another admin — must transfer first
     if (targetCheck.rows[0].role === 'admin') {
       return res.status(400).json({ success: false, message: 'Cannot remove another admin. Transfer ownership first.' });
     }
 
-    // Get target user details for response + notification
-    const targetUser = await query(
-      'SELECT name, email FROM users WHERE id = $1',
-      [targetUserId]
-    );
+    const targetUser = await query('SELECT name, email FROM users WHERE id = $1', [targetUserId]);
     const targetName = targetUser.rows[0]?.name || 'Member';
 
-    // Calculate balance before removing
     const balanceResult = await query(`
       SELECT
         COALESCE(SUM(es.paid_share), 0) as total_paid,
@@ -1314,45 +1111,25 @@ export const removeMember = async (req, res) => {
     const owed = parseFloat(balanceResult.rows[0].total_owed || 0);
     const netBalance = paid - owed;
 
-    // Soft remove
     await query(
       'UPDATE group_members SET is_active = false WHERE group_id = $1 AND user_id = $2',
       [groupId, targetUserId]
     );
 
-    // Get group name for notification
+    await bustGroupCaches(targetUserId, groupId);
+
     const groupDetails = await query('SELECT name FROM groups WHERE id = $1', [groupId]);
     const groupName = groupDetails.rows[0]?.name || 'the group';
 
-    // Notify the removed member
     try {
       await query(
-        `INSERT INTO notifications (user_id, group_id, type, title, message)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          targetUserId,
-          groupId,
-          'member_left',
-          'Removed from Group',
-          `You have been removed from "${groupName}" by the admin.`,
-        ]
+        `INSERT INTO notifications (user_id, group_id, type, title, message) VALUES ($1, $2, $3, $4, $5)`,
+        [targetUserId, groupId, 'member_left', 'Removed from Group', `You have been removed from "${groupName}" by the admin.`]
       );
-
-      // Send push if they have a token
-      const tokenResult = await query('SELECT fcm_token FROM users WHERE id = $1', [targetUserId]);
-      if (tokenResult.rows[0]?.fcm_token) {
-        await sendPushNotification(
-          tokenResult.rows[0].fcm_token,
-          'Removed from Group',
-          `You have been removed from "${groupName}" by the admin.`,
-          { type: 'member_left', group_id: groupId }
-        );
-      }
     } catch (notifyErr) {
       console.error('Notification error (non-fatal):', notifyErr);
     }
 
-    // Notify remaining group members
     try {
       await notifyGroupMembers({
         group_id: groupId,
@@ -1368,10 +1145,7 @@ export const removeMember = async (req, res) => {
     res.json({
       success: true,
       message: `${targetName} has been removed from the group`,
-      balance: {
-        netBalance: netBalance.toFixed(2),
-        hasOutstanding: netBalance !== 0,
-      },
+      balance: { netBalance: netBalance.toFixed(2), hasOutstanding: netBalance !== 0 },
     });
 
   } catch (error) {
@@ -1390,24 +1164,13 @@ export const getUserActivity = async (req, res) => {
       return res.status(400).json({ success: false, message: 'User ID is required' });
     }
 
-    // Fetch all expenses where the user is involved (paid or owes)
     const activityResult = await query(`
       SELECT 
-        e.id,
-        e.description,
-        e.total_amount AS amount,
-        e.currency,
-        e.created_at AS date,
-        e.group_id,
-        g.name AS group_name,
-        u.name AS paid_by_name,
-        u.id AS paid_by_id,
-        es.paid_share,
-        es.owed_share,
-        CASE 
-          WHEN e.paid_by = $1 THEN 'you_paid'
-          ELSE 'you_owe'
-        END AS type
+        e.id, e.description, e.total_amount AS amount, e.currency,
+        e.created_at AS date, e.group_id, g.name AS group_name,
+        u.name AS paid_by_name, u.id AS paid_by_id,
+        es.paid_share, es.owed_share,
+        CASE WHEN e.paid_by = $1 THEN 'you_paid' ELSE 'you_owe' END AS type
       FROM expenses e
       JOIN expense_shares es ON es.expense_id = e.id AND es.user_id = $1
       LEFT JOIN groups g ON e.group_id = g.id
@@ -1431,19 +1194,11 @@ export const getUserActivity = async (req, res) => {
       type: row.type,
     }));
 
-    res.json({
-      success: true,
-      data: activities,
-      total: activities.length,
-    });
+    res.json({ success: true, data: activities, total: activities.length });
 
   } catch (error) {
     console.error('Get user activity error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch user activity',
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: 'Failed to fetch user activity', error: error.message });
   }
 };
 
@@ -1454,15 +1209,11 @@ export const getFriends = async (req, res) => {
 
     const result = await query(`
       SELECT DISTINCT
-        u.id,
-        u.name,
-        u.email,
+        u.id, u.name, u.email,
         COUNT(DISTINCT g.id) as shared_groups
       FROM users u
       JOIN group_members gm1 ON gm1.user_id = u.id AND gm1.is_active = true
-      JOIN group_members gm2 ON gm2.group_id = gm1.group_id 
-        AND gm2.user_id = $1 
-        AND gm2.is_active = true
+      JOIN group_members gm2 ON gm2.group_id = gm1.group_id AND gm2.user_id = $1 AND gm2.is_active = true
       JOIN groups g ON g.id = gm1.group_id AND g.is_active = true
       WHERE u.id != $1
       GROUP BY u.id, u.name, u.email
