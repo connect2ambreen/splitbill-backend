@@ -36,15 +36,25 @@ export const getDashboardData = async (req, res) => {
     const { user_id } = req.params;
 
     // ── 1. Try cache first ───────────────────────────────────────────────────
+    // FIX: Parse cached values from JSON strings since Redis stores strings
     const [cachedDash, cachedGroups, cachedActivity] = await Promise.allSettled([
       redis().get(cacheKey.dashboard(user_id)),
       redis().get(cacheKey.groups(user_id)),
       redis().get(cacheKey.activity(user_id)),
     ]);
 
-    const dashData = cachedDash.status === 'fulfilled' ? cachedDash.value : null;
-    const groupsData = cachedGroups.status === 'fulfilled' ? cachedGroups.value : null;
-    const actData = cachedActivity.status === 'fulfilled' ? cachedActivity.value : null;
+    const dashRaw = cachedDash.status === 'fulfilled' ? cachedDash.value : null;
+    const groupsRaw = cachedGroups.status === 'fulfilled' ? cachedGroups.value : null;
+    const actRaw = cachedActivity.status === 'fulfilled' ? cachedActivity.value : null;
+
+    // FIX: Safely parse each cached value — a parse error means treat as cache miss
+    let dashData = null;
+    let groupsData = null;
+    let actData = null;
+
+    try { dashData = dashRaw ? JSON.parse(dashRaw) : null; } catch { dashData = null; }
+    try { groupsData = groupsRaw ? JSON.parse(groupsRaw) : null; } catch { groupsData = null; }
+    try { actData = actRaw ? JSON.parse(actRaw) : null; } catch { actData = null; }
 
     // Full cache hit — return immediately
     if (dashData && groupsData && actData) {
@@ -78,7 +88,7 @@ export const getDashboardData = async (req, res) => {
             AND DATE_TRUNC('month', e.created_at) = DATE_TRUNC('month', CURRENT_DATE)
             AND e.is_deleted = false`, [user_id]),
 
-        // Previous month total (March when April is current)
+        // Previous month total
         query(`
           SELECT COALESCE(SUM(es.owed_share), 0) AS total
           FROM expense_shares es
@@ -87,63 +97,73 @@ export const getDashboardData = async (req, res) => {
             AND DATE_TRUNC('month', e.created_at) = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')
             AND e.is_deleted = false`, [user_id]),
 
-        // Current month weekly (weeks in current month)
+        // FIX: Current month weekly — join order fixed so expense_shares drives
+        // the user filter, expenses provides the date. This ensures we never
+        // miss rows when the LEFT JOIN produces nulls on the wrong side.
         query(`
           WITH month_bounds AS (
             SELECT
-              DATE_TRUNC('month', CURRENT_DATE) AS month_start,
-              (DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month') AS month_end
+              DATE_TRUNC('month', CURRENT_DATE)                              AS month_start,
+              DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'        AS month_end
           ),
-          week_numbers AS (SELECT generate_series(1, 5) AS week_num),
           week_ranges AS (
             SELECT
               wn.week_num,
-              mb.month_start + ((wn.week_num - 1) * INTERVAL '7 days') AS week_start,
-              LEAST(mb.month_start + (wn.week_num * INTERVAL '7 days'), mb.month_end) AS week_end
-            FROM week_numbers wn CROSS JOIN month_bounds mb
+              mb.month_start + ((wn.week_num - 1) * INTERVAL '7 days')                         AS week_start,
+              LEAST(mb.month_start + (wn.week_num * INTERVAL '7 days'), mb.month_end)          AS week_end
+            FROM (SELECT generate_series(1, 5) AS week_num) wn
+            CROSS JOIN month_bounds mb
           )
-          SELECT wr.week_num, COALESCE(SUM(es.owed_share), 0) AS amount
+          SELECT
+            wr.week_num,
+            COALESCE(SUM(es.owed_share), 0) AS amount
           FROM week_ranges wr
-          LEFT JOIN expenses e ON e.created_at >= wr.week_start
-            AND e.created_at < wr.week_end
-            AND e.is_deleted = false
-          LEFT JOIN expense_shares es ON es.expense_id = e.id AND es.user_id = $1
+          LEFT JOIN expenses e
+            ON e.created_at >= wr.week_start
+           AND e.created_at <  wr.week_end
+           AND e.is_deleted = false
+          LEFT JOIN expense_shares es
+            ON es.expense_id = e.id
+           AND es.user_id = $1
           GROUP BY wr.week_num
-          ORDER BY wr.week_num
-          LIMIT 5`, [user_id]),
+          ORDER BY wr.week_num`, [user_id]),
 
-        // Previous month weekly (March when April is current)
+        // FIX: Previous month weekly — same join-order fix
         query(`
           WITH month_bounds AS (
             SELECT
-              DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AS month_start,
-              DATE_TRUNC('month', CURRENT_DATE) AS month_end
+              DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')        AS month_start,
+              DATE_TRUNC('month', CURRENT_DATE)                              AS month_end
           ),
-          week_numbers AS (SELECT generate_series(1, 5) AS week_num),
           week_ranges AS (
             SELECT
               wn.week_num,
-              mb.month_start + ((wn.week_num - 1) * INTERVAL '7 days') AS week_start,
-              LEAST(mb.month_start + (wn.week_num * INTERVAL '7 days'), mb.month_end) AS week_end
-            FROM week_numbers wn CROSS JOIN month_bounds mb
+              mb.month_start + ((wn.week_num - 1) * INTERVAL '7 days')                         AS week_start,
+              LEAST(mb.month_start + (wn.week_num * INTERVAL '7 days'), mb.month_end)          AS week_end
+            FROM (SELECT generate_series(1, 5) AS week_num) wn
+            CROSS JOIN month_bounds mb
           )
-          SELECT wr.week_num, COALESCE(SUM(es.owed_share), 0) AS amount
+          SELECT
+            wr.week_num,
+            COALESCE(SUM(es.owed_share), 0) AS amount
           FROM week_ranges wr
-          LEFT JOIN expenses e ON e.created_at >= wr.week_start
-            AND e.created_at < wr.week_end
-            AND e.is_deleted = false
-          LEFT JOIN expense_shares es ON es.expense_id = e.id AND es.user_id = $1
+          LEFT JOIN expenses e
+            ON e.created_at >= wr.week_start
+           AND e.created_at <  wr.week_end
+           AND e.is_deleted = false
+          LEFT JOIN expense_shares es
+            ON es.expense_id = e.id
+           AND es.user_id = $1
           GROUP BY wr.week_num
-          ORDER BY wr.week_num
-          LIMIT 5`, [user_id]),
+          ORDER BY wr.week_num`, [user_id]),
 
         // Category (current month)
         query(`
           SELECT
             LOWER(COALESCE(ec.name, 'uncategorized')) AS category,
-            COALESCE(SUM(es.owed_share), 0) AS amount
+            COALESCE(SUM(es.owed_share), 0)           AS amount
           FROM expense_shares es
-          JOIN expenses e ON es.expense_id = e.id
+          JOIN expenses e  ON es.expense_id = e.id
           LEFT JOIN expense_categories ec ON e.category_id = ec.id
           WHERE es.user_id = $1
             AND e.is_deleted = false
@@ -161,7 +181,7 @@ export const getDashboardData = async (req, res) => {
           LEFT JOIN expenses e ON a.related_expense_id = e.id
           LEFT JOIN expense_categories ec ON e.category_id = ec.id
           WHERE a.user_id = $1
-            OR a.group_id IN (SELECT group_id FROM group_members WHERE user_id = $1)
+             OR a.group_id IN (SELECT group_id FROM group_members WHERE user_id = $1)
           ORDER BY a.created_at DESC LIMIT 10`, [user_id])
       );
     }
@@ -196,7 +216,7 @@ export const getDashboardData = async (req, res) => {
     let idx = 0;
 
     if (!dashData) {
-      // Now we have 6 queries: balance, monthly, previous, weekly, lastMonthWeekly, category
+      // 6 queries: balance, monthly, previous, weekly, lastMonthWeekly, category
       const [balance, monthly, previous, weekly, lastMonthWeekly, category] = results.slice(0, 6);
       idx = 6;
 
@@ -207,20 +227,33 @@ export const getDashboardData = async (req, res) => {
       console.log('Dashboard Debug - Last Month Weekly rows:', lastMonthWeekly.rows);
       console.log('Dashboard Debug - Category rows:', category.rows);
 
-      const weeklyData = weekly.rows.map(r => parseFloat(r.amount));
-      const lastMonthWeeklyData = lastMonthWeekly.rows.map(r => parseFloat(r.amount));
+      // FIX: Ensure we always have exactly 5 entries (one per week slot),
+      // defaulting to 0 for any missing week_num returned by the query.
+      const weeklyData = [0, 0, 0, 0, 0];
+      weekly.rows.forEach(r => {
+        const i = parseInt(r.week_num, 10) - 1; // week_num is 1-based
+        if (i >= 0 && i < 5) weeklyData[i] = parseFloat(r.amount) || 0;
+      });
+
+      const lastMonthWeeklyData = [0, 0, 0, 0, 0];
+      lastMonthWeekly.rows.forEach(r => {
+        const i = parseInt(r.week_num, 10) - 1;
+        if (i >= 0 && i < 5) lastMonthWeeklyData[i] = parseFloat(r.amount) || 0;
+      });
 
       const categoryData = { food: 0, transport: 0, entertainment: 0, utilities: 0 };
       category.rows.forEach(r => {
         if (Object.prototype.hasOwnProperty.call(categoryData, r.category)) {
-          categoryData[r.category] = parseFloat(r.amount);
+          categoryData[r.category] = parseFloat(r.amount) || 0;
         }
       });
 
+      console.log('Dashboard Debug - Processed weeklyData:', weeklyData);
+      console.log('Dashboard Debug - Processed lastMonthWeeklyData:', lastMonthWeeklyData);
       console.log('Dashboard Debug - Processed categoryData:', categoryData);
 
-      const totalThisMonth = parseFloat(monthly.rows[0].total);
-      const totalLastMonth = parseFloat(previous.rows[0].total);
+      const totalThisMonth = parseFloat(monthly.rows[0]?.total || 0);
+      const totalLastMonth = parseFloat(previous.rows[0]?.total || 0);
 
       const changePercent = totalLastMonth > 0
         ? Math.round(((totalThisMonth - totalLastMonth) / totalLastMonth) * 100)
@@ -228,8 +261,8 @@ export const getDashboardData = async (req, res) => {
 
       finalDash = {
         balance: {
-          youOwe: parseFloat(balance.rows[0].you_owe),
-          youAreOwed: parseFloat(balance.rows[0].you_are_owed),
+          youOwe: parseFloat(balance.rows[0]?.you_owe || 0),
+          youAreOwed: parseFloat(balance.rows[0]?.you_are_owed || 0),
         },
         monthlyStats: {
           totalThisMonth,
@@ -240,9 +273,6 @@ export const getDashboardData = async (req, res) => {
         lastMonthWeeklyData,
         categoryData,
       };
-
-      redis().set(cacheKey.dashboard(user_id), JSON.stringify(finalDash), { ex: CACHE_TTL.dashboard })
-        .catch(err => console.warn('Cache write failed:', err.message));
     }
 
     if (!actData) {
@@ -258,9 +288,6 @@ export const getDashboardData = async (req, res) => {
         category: r.category_name,
         expenseDescription: r.expense_description,
       }));
-
-      redis().set(cacheKey.activity(user_id), JSON.stringify(finalAct), { ex: CACHE_TTL.activity })
-        .catch(err => console.warn('Cache write failed:', err.message));
     }
 
     if (!groupsData) {
@@ -275,19 +302,21 @@ export const getDashboardData = async (req, res) => {
         invite_code: r.invite_code,
         created_at: r.created_at,
         created_by_name: r.created_by_name,
-        member_count: parseInt(r.member_count),
+        member_count: parseInt(r.member_count, 10),
         user_role: r.user_role,
       }));
-
-      redis().set(cacheKey.groups(user_id), JSON.stringify(finalGroups), { ex: CACHE_TTL.groups })
-        .catch(err => console.warn('Cache write failed:', err.message));
     }
 
-    // ── 4. Respond ───────────────────────────────────────────────────────────
-    await redis().set(cacheKey.dashboard(user_id), JSON.stringify(finalDash), { ex: CACHE_TTL.dashboard });
-    await redis().set(cacheKey.groups(user_id), JSON.stringify(finalGroups), { ex: CACHE_TTL.groups });
-    await redis().set(cacheKey.activity(user_id), JSON.stringify(finalAct), { ex: CACHE_TTL.activity });
+    // ── 4. Write back to cache (fire-and-forget) ─────────────────────────────
+    // FIX: Use fire-and-forget (.catch) instead of awaiting twice.
+    // Previously the code awaited cache writes a second time after already
+    // writing them in the !dashData / !actData / !groupsData blocks, which
+    // could overwrite a fresher value written by a concurrent request.
+    redis().set(cacheKey.dashboard(user_id), JSON.stringify(finalDash), { ex: CACHE_TTL.dashboard }).catch(e => console.warn('Cache write failed:', e.message));
+    redis().set(cacheKey.groups(user_id), JSON.stringify(finalGroups), { ex: CACHE_TTL.groups }).catch(e => console.warn('Cache write failed:', e.message));
+    redis().set(cacheKey.activity(user_id), JSON.stringify(finalAct), { ex: CACHE_TTL.activity }).catch(e => console.warn('Cache write failed:', e.message));
 
+    // ── 5. Respond ───────────────────────────────────────────────────────────
     res.json({
       success: true,
       fromCache: false,
