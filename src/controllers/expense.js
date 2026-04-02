@@ -41,19 +41,17 @@ export const getGroupBalance = async (req, res) => {
 // ─── Expense Details ──────────────────────────────────────────────────────────
 export const getExpenseDetails = async (req, res) => {
   try {
-    const { expense_id } = req.params;
+    const expenseId = parseInt(req.params.expense_id, 10);  // Parse to integer
+    if (isNaN(expenseId)) {
+      return res.status(400).json({ success: false, message: 'Invalid expense ID' });
+    }
 
-    const expenseResult = await query(`
-      SELECT e.id, e.description, e.total_amount, e.currency, e.paid_by,
-             e.created_at, e.split_type, e.category_id,
-             u.name as paid_by_name, ec.name as category_name
-      FROM expenses e
-      LEFT JOIN users u ON e.paid_by = u.id
-      LEFT JOIN expense_categories ec ON e.category_id = ec.id
-      WHERE e.id = $1 AND e.is_deleted = false
-    `, [expense_id]);
+    const result = await query(
+      'SELECT * FROM expenses WHERE id = $1',
+      [expenseId]  // Use the parsed integer
+    );
 
-    if (expenseResult.rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Expense not found' });
     }
 
@@ -62,9 +60,9 @@ export const getExpenseDetails = async (req, res) => {
       FROM expense_shares es
       JOIN users u ON es.user_id = u.id
       WHERE es.expense_id = $1 ORDER BY es.user_id
-    `, [expense_id]);
+    `, [expenseId]);
 
-    res.json({ success: true, data: { ...expenseResult.rows[0], splits: splitsResult.rows } });
+    res.json({ success: true, data: { ...result.rows[0], splits: splitsResult.rows } });
   } catch (error) {
     console.error('Get expense details error:', error);
     res.status(500).json({ success: false, message: 'Server error while fetching expense details' });

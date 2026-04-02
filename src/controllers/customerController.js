@@ -93,7 +93,7 @@ export const getCustomers = async (req, res) => {
     const cacheKey = customersKey(userId);
 
     // 1. Check Redis first
-    const cached = await redis.get(cacheKey);
+    const cached = await redis().get(cacheKey);
     if (cached) {
       return res.json({ success: true, ...cached });
     }
@@ -141,7 +141,7 @@ export const getCustomers = async (req, res) => {
     };
 
     // 3. Store in Redis for 60 seconds
-    await redis.set(cacheKey, { data, summary }, { ex: 60 });
+    await redis().set(cacheKey, { data, summary }, { ex: 60 });
 
     res.json({ success: true, data, summary });
   } catch (error) {
@@ -173,7 +173,7 @@ export const createCustomer = async (req, res) => {
     );
 
     // Bust customers cache
-    await redis.del(customersKey(userId));
+    await redis().del(customersKey(userId));
 
     res.status(201).json({
       success: true,
@@ -215,7 +215,7 @@ export const updateCustomer = async (req, res) => {
     );
 
     // Bust customers cache
-    await redis.del(customersKey(userId));
+    await redis().del(customersKey(userId));
 
     res.json({
       success: true,
@@ -249,7 +249,7 @@ export const deleteCustomer = async (req, res) => {
     );
 
     // Bust customers cache
-    await redis.del(customersKey(userId));
+    await redis().del(customersKey(userId));
 
     res.json({ success: true, message: 'Customer deleted successfully' });
   } catch (error) {
@@ -280,7 +280,7 @@ export const getTransactions = async (req, res) => {
     const cacheKey = transactionsKey(customer_id);
 
     // 1. Check Redis first
-    const cached = await redis.get(cacheKey);
+    const cached = await redis().get(cacheKey);
     if (cached) {
       return res.json({ success: true, data: cached });
     }
@@ -310,7 +310,7 @@ export const getTransactions = async (req, res) => {
     const data = withBalance.reverse();
 
     // 3. Store in Redis for 30 seconds
-    await redis.set(cacheKey, data, { ex: 30 });
+    await redis().set(cacheKey, data, { ex: 30 });
 
     res.json({ success: true, data });
   } catch (error) {
@@ -363,8 +363,8 @@ export const addTransaction = async (req, res) => {
 
     // Bust both caches — transaction list AND customer balance summary
     await Promise.all([
-      redis.del(transactionsKey(customer_id)),
-      redis.del(customersKey(userId)),
+      redis().del(transactionsKey(customer_id)),
+      redis().del(customersKey(userId)),
     ]);
 
     res.status(201).json({
@@ -423,8 +423,8 @@ export const updateTransaction = async (req, res) => {
 
     // Bust both caches
     await Promise.all([
-      redis.del(transactionsKey(customer_id)),
-      redis.del(customersKey(userId)),
+      redis().del(transactionsKey(customer_id)),
+      redis().del(customersKey(userId)),
     ]);
 
     res.json({
@@ -461,8 +461,8 @@ export const deleteTransaction = async (req, res) => {
 
     // Bust both caches
     await Promise.all([
-      redis.del(transactionsKey(customer_id)),
-      redis.del(customersKey(userId)),
+      redis().del(transactionsKey(customer_id)),
+      redis().del(customersKey(userId)),
     ]);
 
     res.json({ success: true, message: 'Transaction deleted successfully' });

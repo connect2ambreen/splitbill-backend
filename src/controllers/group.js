@@ -7,14 +7,24 @@ import redis from '../config/redis.js';
 import crypto from 'crypto';
 
 // ─── Cache helpers ────────────────────────────────────────────────────────────
+const CACHE_TTL = {
+  groups: 120,      // 2 minutes — group list changes less often
+  members: 60,      // 1 minute — member changes moderately
+  details: 300,     // 5 minutes — group details change rarely
+};
+
+// add this function
 const bustGroupCaches = async (userId, groupId) => {
   try {
-    const keys = [];
-    if (userId) keys.push(`groups:${userId}`);
-    if (groupId) keys.push(`group_members:${groupId}`, `group_detail:${groupId}`);
-    if (keys.length) await Promise.all(keys.map(k => redis.del(k)));
-  } catch (e) {
-    console.error('Redis bust error:', e);
+    const ops = [];
+    if (userId) ops.push(redis().del(`groups:${userId}`));
+    if (groupId) {
+      ops.push(redis().del(`group_members:${groupId}`));
+      ops.push(redis().del(`group_detail:${groupId}`));
+    }
+    if (ops.length > 0) await Promise.allSettled(ops);
+  } catch (err) {
+    console.warn('bustGroupCaches error:', err.message || err);
   }
 };
 
@@ -368,7 +378,7 @@ export const getUserGroups = async (req, res) => {
     const cacheKey = `groups:${user_id}`;
 
     try {
-      const cached = await redis.get(cacheKey);
+      const cached = await redis().get(cacheKey);
       if (cached) {
         return res.json({ success: true, data: cached, fromCache: true });
       }
@@ -427,7 +437,7 @@ export const getUserGroups = async (req, res) => {
     }));
 
     try {
-      await redis.set(cacheKey, groups, { ex: 60 });
+      await redis().set(cacheKey, groups, { ex: CACHE_TTL.groups });
     } catch (e) {
       console.error('Redis set error (getUserGroups):', e);
     }
@@ -453,7 +463,7 @@ export const getGroupMembers = async (req, res) => {
     const cacheKey = `group_members:${group_id}`;
 
     try {
-      const cached = await redis.get(cacheKey);
+      const cached = await redis().get(cacheKey);
       if (cached) {
         return res.json({ success: true, data: cached, fromCache: true });
       }
@@ -481,7 +491,7 @@ export const getGroupMembers = async (req, res) => {
     const result = await query(membersQuery, [group_id]);
 
     try {
-      await redis.set(cacheKey, result.rows, { ex: 120 });
+      await redis().set(cacheKey, result.rows, { ex: CACHE_TTL.members });
     } catch (e) {
       console.error('Redis set error (getGroupMembers):', e);
     }
@@ -908,7 +918,7 @@ export const getGroupDetails = async (req, res) => {
     const cacheKey = `group_detail:${groupId}`;
 
     try {
-      const cached = await redis.get(cacheKey);
+      const cached = await redis().get(cacheKey);
       if (cached) {
         return res.json({ success: true, data: cached, fromCache: true });
       }
@@ -949,7 +959,7 @@ export const getGroupDetails = async (req, res) => {
     };
 
     try {
-      await redis.set(cacheKey, groupData, { ex: 120 });
+      await redis().set(cacheKey, groupData, { ex: CACHE_TTL.details });
     } catch (e) {
       console.error('Redis set error (getGroupDetails):', e);
     }

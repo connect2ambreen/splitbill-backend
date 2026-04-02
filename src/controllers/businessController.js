@@ -43,7 +43,7 @@ export const createBusiness = async (req, res) => {
     const isNew = business.was_inserted;
 
     // Bust cache so next GET fetches fresh data
-    await redis.del(businessKey(userId));
+    await redis().del(businessKey(userId));
 
     res.status(isNew ? 201 : 200).json({
       success: true,
@@ -65,7 +65,7 @@ export const getUserBusiness = async (req, res) => {
     const cacheKey = businessKey(userId);
 
     // 1. Check Redis first
-    const cached = await redis.get(cacheKey);
+    const cached = await redis().get(cacheKey);
     if (cached) {
       return res.json({ success: true, data: cached });
     }
@@ -79,7 +79,7 @@ export const getUserBusiness = async (req, res) => {
     const data = result.rows[0] || null;
 
     // 3. Store in Redis for 5 minutes
-    await redis.set(cacheKey, data, { ex: 300 });
+    await redis().set(cacheKey, data, { ex: 300 });
 
     res.json({ success: true, data });
   } catch (error) {
@@ -126,7 +126,7 @@ export const updateBusiness = async (req, res) => {
     );
 
     // Bust cache
-    await redis.del(businessKey(userId));
+    await redis().del(businessKey(userId));
 
     res.json({
       success: true,
@@ -157,7 +157,7 @@ export const deleteBusiness = async (req, res) => {
     }
 
     // Bust cache
-    await redis.del(businessKey(userId));
+    await redis().del(businessKey(userId));
 
     res.json({ success: true, message: 'Business deleted successfully' });
   } catch (error) {
