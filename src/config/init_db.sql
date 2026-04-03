@@ -4,18 +4,18 @@ BEGIN;
 -- USERS
 -- ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS users (
-    id              SERIAL PRIMARY KEY,
-    name            VARCHAR(100) NOT NULL,
-    email           VARCHAR(150) UNIQUE NOT NULL,
-    password        TEXT NOT NULL,
-    phone           VARCHAR(20),
-    profile_url     TEXT,
+    id               SERIAL PRIMARY KEY,
+    name             VARCHAR(100) NOT NULL,
+    email            VARCHAR(150) UNIQUE NOT NULL,
+    password         TEXT NOT NULL,
+    phone            VARCHAR(20),
+    profile_url      TEXT,
     default_currency VARCHAR(10) DEFAULT 'USD',
-    locale          JSONB DEFAULT '{"flag": "🇺🇸", "country": "US", "currency": "USD", "language": "en", "currencySymbol": "$"}',
-    fcm_token       TEXT,
-    bio_pub_key     TEXT,
-    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    locale           JSONB DEFAULT '{"flag": "🇺🇸", "country": "US", "currency": "USD", "language": "en", "currencySymbol": "$"}',
+    fcm_token        TEXT,
+    bio_pub_key      TEXT,                          -- added from ALTER TABLE
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ─────────────────────────────────────────────────────────────
@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS expense_categories (
     name VARCHAR(50) UNIQUE NOT NULL
 );
 
+-- Seed all 4 categories (safe re-run with ON CONFLICT DO NOTHING)
+INSERT INTO expense_categories (name) VALUES
+    ('Food'),
+    ('Transport'),
+    ('Entertainment'),
+    ('Utilities')
+ON CONFLICT (name) DO NOTHING;
+
 -- ─────────────────────────────────────────────────────────────
 -- EXPENSES
 -- ─────────────────────────────────────────────────────────────
@@ -101,8 +109,12 @@ CREATE TABLE IF NOT EXISTS expenses (
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_expenses_group ON expenses(group_id);
+CREATE INDEX IF NOT EXISTS idx_expenses_group          ON expenses(group_id);
+CREATE INDEX IF NOT EXISTS idx_expenses_deleted_created ON expenses(is_deleted, created_at);  -- dashboard filter
 
+-- ─────────────────────────────────────────────────────────────
+-- EXPENSE SHARES
+-- ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS expense_shares (
     id         SERIAL PRIMARY KEY,
     expense_id INTEGER REFERENCES expenses(id) ON DELETE CASCADE,
@@ -111,7 +123,8 @@ CREATE TABLE IF NOT EXISTS expense_shares (
     paid_share NUMERIC(10, 2) DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_expense_shares_user ON expense_shares(user_id);
+CREATE INDEX IF NOT EXISTS idx_expense_shares_user       ON expense_shares(user_id);
+CREATE INDEX IF NOT EXISTS idx_expense_shares_expense_id ON expense_shares(expense_id);  -- JOIN performance
 
 -- ─────────────────────────────────────────────────────────────
 -- SETTLEMENTS
@@ -165,7 +178,8 @@ CREATE TABLE IF NOT EXISTS activities (
     created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_activities_user ON activities(user_id);
+-- Composite index: user_id + created_at DESC for ORDER BY DESC LIMIT queries
+CREATE INDEX IF NOT EXISTS idx_activities_user_created ON activities(user_id, created_at DESC);
 
 -- ─────────────────────────────────────────────────────────────
 -- LEDGER MODULE (DIGIKHATA / HISAAB STYLE)
@@ -228,13 +242,13 @@ CREATE TABLE IF NOT EXISTS ledger_transactions (
     type             VARCHAR(10) NOT NULL CHECK (type IN ('gave', 'got')),
     amount           NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
     note             TEXT,
-    transaction_date TIMESTAMPTZ,
-    attachments      TEXT DEFAULT '[]',
+    transaction_date TIMESTAMPTZ,      -- added from ALTER TABLE
+    attachments      TEXT DEFAULT '[]', -- added from ALTER TABLE
     created_at       TIMESTAMP DEFAULT NOW(),
     updated_at       TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_ledger_customer_id  ON ledger_transactions(customer_id);
-CREATE INDEX IF NOT EXISTS idx_ledger_business_id  ON ledger_transactions(business_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_customer_id ON ledger_transactions(customer_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_business_id ON ledger_transactions(business_id);
 
 COMMIT;
